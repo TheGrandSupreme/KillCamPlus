@@ -1,0 +1,8 @@
+numpy
+opencv-python
+keyboard
+pywin32
+ttkbootstrap
+dxcam==0.0.5
+soundcard==0.4.6
+pyinstaller
