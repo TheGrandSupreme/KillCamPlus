@@ -5,7 +5,52 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE_DIR = getattr(sys, "_MEIPASS", SCRIPT_DIR)
-CONFIG_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else SCRIPT_DIR
+
+
+def _frozen_config_dir():
+    """Per-user config dir for frozen builds.
+
+    The exe lives in Program Files (not writable without elevation), so
+    settings must NOT sit next to it. %APPDATA%\\KillCam+ is always
+    writable; the bundled pristine settings seed it on first run.
+    """
+    base = os.getenv("APPDATA")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    path = os.path.join(base, "KillCam+")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def _bundled_settings_path():
+    """Pristine settings shipped with the app (first-run seed)."""
+    candidates = []
+    try:
+        if getattr(sys, "frozen", False):
+            candidates.append(os.path.join(
+                os.path.dirname(sys.executable), "settings.json"))
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(os.path.join(meipass, "settings.json"))
+    except (TypeError, AttributeError, OSError):
+        pass
+    candidates.append(os.path.join(SCRIPT_DIR, "settings.json"))
+    for cand in candidates:
+        try:
+            if cand and os.path.isfile(cand):
+                return cand
+        except (TypeError, OSError, ValueError):
+            continue
+    return None
+
+
+if getattr(sys, "frozen", False):
+    CONFIG_DIR = _frozen_config_dir()
+else:
+    CONFIG_DIR = SCRIPT_DIR
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 
 DEFAULT_SETTINGS = {
@@ -115,6 +160,18 @@ def load_settings(path=SETTINGS_PATH):
             saved = {}
     except (OSError, ValueError, TypeError):
         saved = {}
+    if not saved and path == SETTINGS_PATH:
+        # First run (or deleted config): seed from the bundled pristine
+        # copy so installer defaults apply, then normalize below.
+        try:
+            seed = _bundled_settings_path()
+            if seed and os.path.abspath(seed) != os.path.abspath(path):
+                with open(seed, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    saved = loaded
+        except (OSError, ValueError, TypeError):
+            pass
     settings.update({key: saved[key] for key in _KNOWN_KEYS if key in saved})
     saved_hotkeys = saved.get("hotkeys")
     if isinstance(saved_hotkeys, dict):
@@ -125,6 +182,10 @@ def load_settings(path=SETTINGS_PATH):
 
 def save_settings(settings, path=SETTINGS_PATH):
     try:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except (OSError, TypeError, ValueError):
+            pass
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(settings, handle, indent=4)
         return True

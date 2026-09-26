@@ -1192,6 +1192,8 @@ class UI:
         ).pack()
         PillButton(abt_card.inner, text="All versions", bootstyle="primary",
                    command=lambda: self.open_releases_page()).pack(pady=(10, 0))
+        PillButton(abt_card.inner, text="Support me!", bootstyle="primary",
+                   command=lambda: self.open_support_page()).pack(pady=(10, 0))
 
         # ---- Bottom controls ----
         controls = tb.Frame(main_frame)
@@ -1921,13 +1923,22 @@ class UI:
 
     def open_releases_page(self):
         """Open the GitHub releases page in the default browser."""
+        self._open_link(
+            "https://github.com/TheGrandSupreme/KillCamPlus/releases",
+            "releases")
+
+    def open_support_page(self):
+        """Open the Buy Me a Coffee page in the default browser."""
+        self._open_link("https://buymeacoffee.com/thegrandsupreme",
+                        "support")
+
+    def _open_link(self, url, what):
         try:
             import webbrowser
-            webbrowser.open(
-                "https://github.com/TheGrandSupreme/KillCamPlus/releases")
+            webbrowser.open(url)
         except Exception:
             try:
-                self.notify("Could not open the releases page.")
+                self.notify("Could not open the %s page." % what)
             except Exception:
                 pass
 
