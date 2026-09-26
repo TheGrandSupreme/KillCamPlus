@@ -221,6 +221,28 @@ def _trex_defaults(init_seg):
     return out
 
 
+def _moof_samples(data, moof_off, moof_size, trex):
+    """First traf of a moof. Returns (is_sync_or_None, base_or_None, count)."""
+    is_sync, base = _moof_info(data, moof_off, moof_size, trex)
+    count = 0
+    try:
+        for typ, off, size, hdr in _mp4_children(
+                data, moof_off + 8, moof_off + moof_size):
+            if typ != b"traf":
+                continue
+            # trun is a direct child of traf; sum every trun present.
+            for t2, o2, s2, h2 in _mp4_children(data, off + hdr, off + size):
+                if t2 == b"trun":
+                    body = o2 + h2
+                    if body + 8 <= o2 + s2:
+                        count += int.from_bytes(
+                            data[body + 4:body + 8], "big")
+            break  # first traf only (video-only stream)
+    except (IndexError, ValueError):
+        pass
+    return is_sync, base, count
+
+
 def _moof_info(data, moof_off, moof_size, trex):
     """First traf of a moof. Returns (is_sync_or_None, base_time_or_None)."""
     is_sync = None
@@ -269,27 +291,6 @@ def _moof_info(data, moof_off, moof_size, trex):
     except (IndexError, ValueError):
         pass
     return is_sync, base_time
-
-
-def _count_video_samples(frag, boxes, cut_off):
-    """Total trun sample counts for moofs at/after cut_off."""
-    total = 0
-    try:
-        for typ, off, size in boxes:
-            if typ != b"moof" or off < cut_off:
-                continue
-            for t2, o2, s2, h2 in _mp4_children(frag, off + 8, off + size):
-                if t2 != b"traf":
-                    continue
-                for t3, o3, s3, h3 in _mp4_children(frag, o2 + h2, o2 + s2):
-                    if t3 == b"trun":
-                        body = o3 + h3
-                        if body + 8 <= o3 + s3:
-                            total += int.from_bytes(
-                                frag[body + 4:body + 8], "big")
-    except (IndexError, ValueError):
-        pass
-    return total
 
 
 class Recorder:
@@ -363,6 +364,9 @@ class Recorder:
         self._read_thread = None
         self._latest_lock = threading.Lock()
         self._latest_jpeg = None
+        self._latest_seq = 0  # bumped per fresh capture; writer skips
+        # re-feeding an unchanged frame (same pixels cost a full
+        # encode each slot; a gap reads identically to a duplicate).
         self._audio_threads = []
         self._audio_generation = 0
         # Per-app capture (process loopback stems; empty until the UI
@@ -449,8 +453,15 @@ class Recorder:
         (A GPU-decode variant was trialed and removed: mjpeg_cuvid init
         hangs nondeterministically on some sessions instead of failing,
         stalling startup. CPU decode is verified on all paths.)
+
+        Wall-clock arrival timestamps: under gaming load the writer can
+        feed fewer frames than wall slots (blocked pipe). Count-based
+        timestamps would then compress 30 s of wall into a short sped-up
+        clip; arrival timestamps keep stream duration == wall time, so
+        shortfalls read as judder and audio stays honest.
         """
         return ["-thread_queue_size", "1024",
+                "-use_wallclock_as_timestamps", "1",
                 "-f", "image2pipe", "-vcodec", "mjpeg"]
 
     def _compression_profile(self):
@@ -728,7 +739,7 @@ class Recorder:
         idle_interval = min(1.0 / 15.0, target_interval * 4)
         poll_interval = target_interval
         last_thumb = 0.0
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 95]
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
         thumb_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
         prev_small = None
         skip_streak = 0
@@ -743,7 +754,7 @@ class Recorder:
             if frame is not None:
                 resized = self._resize_frame(frame)
                 # Cheap change check on a 64x36 stamp (~0.3 ms) vs a full
-                # q95 encode (~15 ms): static content skips the encode.
+                # q85 encode (~10 ms): static content skips the encode.
                 small = cv2.resize(resized, (64, 36),
                                    interpolation=cv2.INTER_NEAREST)
                 identical = (prev_small is not None and skip_streak < 30
@@ -762,11 +773,12 @@ class Recorder:
                     _, jpeg_bytes = cv2.imencode(".jpg", resized, encode_params)
                     with self._latest_lock:
                         self._latest_jpeg = jpeg_bytes.tobytes()
+                        self._latest_seq += 1
                     del jpeg_bytes
                     # Preview thumbnail throttled to ~7fps, decoded at half
                     # res (plenty for a 480px preview, ~half the decode cost)
                     t = time.monotonic()
-                    if t - last_thumb >= 0.15:
+                    if t - last_thumb >= 0.25:
                         last_thumb = t
                         try:
                             with self._latest_lock:
@@ -799,27 +811,41 @@ class Recorder:
                 next_tick = time.monotonic()
 
     def _write_loop(self, fps, generation):
-        """Emit exactly one frame per 1/fps wall slot to ffmpeg stdin.
+        """Emit wall-paced slots to ffmpeg stdin.
 
-        Repeats the latest JPEG when encoding lags, so the stream holds
-        a true 60.0 (or target) fps wall rate: video duration always
-        equals wall time and audio can never overhang the video.
+        The encoder stamps wall-clock arrival times (live input flag),
+        so stream duration always equals wall time: slots skipped under
+        load read as judder, never as a sped-up clip, and audio can
+        never overhang the video.
+
+        Unchanged frames are NOT re-fed every slot: a gap reads
+        identically to a duplicate but costs no encode. A 2 Hz minimum
+        cadence keeps fragment/cut granularity tight on static scenes.
         """
         target_interval = 1.0 / max(1, fps)
+        min_interval = 0.5
         next_tick = time.monotonic()
         proc = self._ffmpeg_proc
+        last_sent_seq = -1
+        last_sent_wall = 0.0
         while self.recording and generation == self._stream_generation:
             if proc is None or proc.poll() is not None:
                 break
             with self._latest_lock:
                 jpeg = self._latest_jpeg
-            if jpeg is not None:
+                seq = self._latest_seq
+            now = time.monotonic()
+            if jpeg is not None and (
+                    seq != last_sent_seq
+                    or now - last_sent_wall >= min_interval):
                 try:
                     proc.stdin.write(jpeg)
                 except (BrokenPipeError, OSError, ValueError):
                     break
                 t_wall = time.monotonic()
                 self._last_feed_wall = t_wall
+                last_sent_wall = t_wall
+                last_sent_seq = seq
                 with self._frag_lock:
                     self._feed_walls.append(t_wall)
                     self._feed_total += 1
@@ -905,6 +931,7 @@ class Recorder:
             self._ffmpeg_proc = proc
         with self._latest_lock:
             self._latest_jpeg = None
+            self._latest_seq = 0
         cap = threading.Thread(
             target=self._capture_loop, args=(fps, generation), daemon=True)
         writer = threading.Thread(
@@ -996,42 +1023,70 @@ class Recorder:
         timescale = _video_timescale(init_seg) or 15360
         buf_sec = float(int(self.settings.get("buffer_seconds", 20)))
 
-        def _wall_of(base):
-            """Map stream baseMediaDecodeTime to feed wall time."""
-            if base is None or not feed_walls:
-                return None, None
-            idx = int(round(base * fps / float(timescale)))
-            base_idx = feed_total - len(feed_walls)
-            return feed_walls[min(max(idx - base_idx, 0),
-                                  len(feed_walls) - 1)], idx
+        # Wall mapping from SAMPLE COUNTS, never stream timestamps: walk
+        # trun counts in ring order; absolute frame index of the ring's
+        # first sample = feed_total - total_samples; each moof's first
+        # sample maps to its feed wall. Immune to timestamp scheme,
+        # sparseness, unflushed tails, and eviction (feed_walls always
+        # covers the ring span: the writer ticks bound its length, and
+        # every fed frame -- duplicates included -- appends exactly one
+        # wall, so counts stay 1:1 with feeds).
+        boxes, _ = _scan_fragments(frag)
+        moofs = []  # (off, is_sync, base, count), ring order
+        for typ, off, size in boxes:
+            if typ != b"moof":
+                continue
+            is_sync, base, count = _moof_samples(frag, off, size, trex)
+            moofs.append((off, is_sync, base, count))
+        total_samples = sum(m[3] for m in moofs)
+        if total_samples <= 0 or not feed_walls:
+            self.last_save_error = "no decodable fragment"
+            del frag
+            return False
+        first_abs = feed_total - total_samples
+        walls_base = feed_total - len(feed_walls)
+
+        def _wall_of_abs(abs_idx):
+            try:
+                i = int(abs_idx) - walls_base
+            except (TypeError, ValueError):
+                return None
+            if not feed_walls:
+                return None
+            return feed_walls[min(max(i, 0), len(feed_walls) - 1)]
+
+        # End = last sample of the last moof in the ring (NOT last_feed:
+        # fed-but-unflushed tail frames have no timestamps yet).
+        end_abs = first_abs + total_samples - 1
+        end_wall = _wall_of_abs(end_abs)
+        if end_wall is None:
+            end_wall = last_feed
+        end_idx = end_abs
+        last_base = moofs[-1][2]
 
         # Clip window: trailing buf_sec of wall time. Start at the first
         # keyframe-led fragment at/after (end - buf_sec) so the clip
         # covers exactly the replay window.
-        _end_wall, _end_idx = _wall_of(last_base)
-        end_wall = _end_wall if _end_wall is not None else last_feed
-        end_idx = _end_idx
         t_ideal = end_wall - buf_sec
         cut_wall = None
         cut_off = None
         cut_idx = None
-        boxes, _ = _scan_fragments(frag)
+        cut_base = None
         first_sync = None
-        for typ, off, size in boxes:
-            if typ != b"moof":
-                continue
-            is_sync, base = _moof_info(frag, off, size, trex)
-            if not is_sync:
-                continue
-            wall, idx = _wall_of(base)
-            if first_sync is None:
-                first_sync = (off, wall, idx)
-            if wall is not None and wall >= t_ideal:
-                cut_off, cut_wall, cut_idx = off, wall, idx
-                break
+        running = first_abs
+        for off, is_sync, base, count in moofs:
+            if is_sync:
+                wall = _wall_of_abs(running)
+                if first_sync is None:
+                    first_sync = (off, wall, running, base)
+                if wall is not None and wall >= t_ideal:
+                    cut_off, cut_wall, cut_idx = off, wall, running
+                    cut_base = base
+                    break
+            running += count
         if cut_off is None:
             if first_sync is not None:
-                cut_off, cut_wall, cut_idx = first_sync
+                cut_off, cut_wall, cut_idx, cut_base = first_sync
             else:
                 self.last_save_error = "no decodable fragment"
                 del frag
@@ -1053,14 +1108,18 @@ class Recorder:
             del frag
             return False
         duration = min(duration, buf_sec + 2.0)
-        # Insurance: audio must never exceed the actual video frame count.
-        # (Guards any feed underrun; normally a no-op.) Tolerance is
-        # two frame intervals + 50 ms so genuine shortfalls still trim.
-        n_vid = _count_video_samples(frag, boxes, cut_off)
-        if n_vid > 0:
-            vid_dur = n_vid / float(fps)
-            if vid_dur < duration - (2.0 / fps + 0.05):
-                duration = max(0.5, vid_dur)
+        # Insurance: the clip cannot outrun the video stream's own
+        # timestamp span (guards any feed underrun; normally a no-op).
+        # Span-based, NOT sample-count-based: under load fewer frames
+        # cover the same wall span, and count/fps would wrongly shrink
+        # the clip into a sped-up fragment.
+        if last_base is not None and cut_base is not None:
+            try:
+                vid_span = (last_base - cut_base) / float(timescale)
+            except (TypeError, ValueError, ZeroDivisionError):
+                vid_span = 0.0
+            if vid_span > 0.5 and vid_span < duration - 0.25:
+                duration = max(0.5, vid_span)
 
         media = init_seg + frag[cut_off:]
         del frag

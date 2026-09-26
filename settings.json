@@ -7,7 +7,7 @@
     "record_microphone": true,
     "record_system_audio": true,
     "audio_mode": "mixed",
-    "compression": "Medium",
+    "compression": "High",
     "save_folder": "C:\\Users\\tomas\\Videos\\Captures",
     "hotkeys": {
         "save_clip": "shift+f9",

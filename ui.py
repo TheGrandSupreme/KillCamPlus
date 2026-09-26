@@ -892,11 +892,41 @@ class UI:
         y = 20
 
         toast.geometry(f"{width}x{height}+{x}+{y}")
-        toast.configure(bg="black")
+
+        # Pill bubble cut OUT of the window: magenta is keyed transparent
+        # so only the rounded bubble shows (no rectangle corners).
+        # Applied both immediately and once mapped: keying a not-yet-
+        # mapped window silently no-ops on some builds, leaving the
+        # black rectangle. Post-map application is the reliable order.
+        _key = "#ff00ff"
+        _state = {"keyed": False}
+
+        def _apply_key():
+            # Window + canvas magenta, keyed transparent. On failure both
+            # go black: never a magenta box, worst case the old square.
+            try:
+                if not toast.winfo_exists():
+                    return
+                toast.configure(bg=_key)
+                toast.attributes("-transparentcolor", _key)
+                canvas.configure(bg=_key)
+                _state["keyed"] = True
+            except (tk.TclError, NameError):
+                try:
+                    toast.configure(bg="black")
+                except tk.TclError:
+                    pass
+                try:
+                    canvas.configure(bg="black")
+                except (tk.TclError, NameError):
+                    pass
+        # Canvas starts magenta (keyed out with the window corners); if
+        # keying ever fails _apply_key repaints window + canvas black.
+        _canvas_bg = _key
 
         # Rounded pill toast: black-on-black canvas so the window's square
         # corners disappear and only the rounded bubble shows.
-        canvas = tk.Canvas(toast, width=width, height=height, bg="black",
+        canvas = tk.Canvas(toast, width=width, height=height, bg=_canvas_bg,
                            highlightthickness=0, borderwidth=0)
         canvas.pack(fill="both", expand=True)
         try:
@@ -907,6 +937,12 @@ class UI:
                                font=("Supreme", 10), fill="white",
                                width=150, justify="center")
             toast.update_idletasks()
+        except tk.TclError:
+            pass
+        # Key now (pre-map attempt) and re-assert once mapped.
+        _apply_key()
+        try:
+            toast.after(50, _apply_key)
         except tk.TclError:
             pass
 
@@ -1184,7 +1220,7 @@ class UI:
 
         # ---- About Tab ----
         tb.Label(abt_card.inner, text="KillCam+", font=("Supreme", 18, "bold")).pack(pady=10)
-        tb.Label(abt_card.inner, text="v2.0.0", font=("Supreme", 10)).pack(pady=(0, 6))
+        tb.Label(abt_card.inner, text="2.1.0", font=("Supreme", 10)).pack(pady=(0, 6))
         tb.Label(
             abt_card.inner,
             text="Light-weight clipping software\nMade by TGS",
