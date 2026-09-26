@@ -3,22 +3,25 @@
     "system_audio_device": "Speakers (2- USB Audio Device)",
     "resolution": "1920x1080",
     "fps": 60,
-    "buffer_seconds": 20,
+    "buffer_seconds": 30,
     "record_microphone": true,
     "record_system_audio": true,
     "audio_mode": "mixed",
     "compression": "Medium",
     "save_folder": "C:\\Users\\tomas\\Videos\\Captures",
     "hotkeys": {
-        "save_clip": "f9",
+        "save_clip": "shift+f9",
         "toggle_mic": "shift+alt+m",
         "toggle_system_audio": "shift+alt+s"
     },
-    "start_with_windows": false,
+    "start_with_windows": true,
     "mic_volume": 100,
-    "system_volume": 100,
+    "system_volume": 80,
     "monitor_index": 0,
-    "app_volumes": {},
+    "app_volumes": {
+        "OpenCode.exe": 0,
+        "System Sounds": 100
+    },
     "last_mic_volume": 100,
-    "last_system_volume": 100
+    "last_system_volume": 80
 }

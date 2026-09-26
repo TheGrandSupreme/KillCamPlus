@@ -1249,6 +1249,41 @@ class Recorder:
         self.system_volume = max(0, min(100, int(vol)))
         self.settings["system_volume"] = self.system_volume
 
+    def _available_outputs(self):
+        """Number of dxcam outputs, or None when the query fails."""
+        try:
+            info = dxcam.output_info()
+        except Exception:
+            return None
+        try:
+            lines = [ln for ln in str(info).splitlines() if ln.strip()]
+        except Exception:
+            return None
+        return len(lines) if lines else None
+
+    def _clamp_monitor_index(self):
+        """Clamp monitor_index into the live dxcam range.
+
+        A saved index from a docked/multi-monitor setup goes stale on
+        relaunch with fewer displays; dxcam.create would then raise and
+        the app would boot with recording off. Fall back to 0 and keep
+        settings in sync so the next save is honest.
+        """
+        try:
+            idx = max(0, int(self.settings.get("monitor_index",
+                                               self.monitor_index)))
+        except (ValueError, TypeError):
+            idx = 0
+        count = self._available_outputs()
+        if count is not None and idx >= count:
+            idx = 0
+        self.monitor_index = idx
+        try:
+            self.settings["monitor_index"] = idx
+        except (TypeError, AttributeError):
+            pass
+        return idx
+
     # --------------------------------------------------------
     # START / STOP REPLAY BUFFER
     # --------------------------------------------------------
@@ -1257,6 +1292,7 @@ class Recorder:
         if self.recording:
             return
 
+        self._clamp_monitor_index()
         fps = int(self.settings.get("fps", 60))
         # Smoke-test encoder flags (re-validated when fps changes, since
         # bitrate caps scale with fps)
@@ -1299,8 +1335,22 @@ class Recorder:
         try:
             # Small dxcam buffer: we consume every slot, so a deep queue
             # only wastes RAM (~6 MB/frame at 1080p, 64 deep = ~400 MB).
-            self.camera = dxcam.create(output_idx=self.monitor_index, output_color="BGR",
-                                       max_buffer_len=8)
+            # One retry on output 0: a stale saved index must never leave
+            # the app booted with recording off.
+            try:
+                self.camera = dxcam.create(output_idx=self.monitor_index, output_color="BGR",
+                                           max_buffer_len=8)
+            except Exception:
+                if self.monitor_index != 0:
+                    self.monitor_index = 0
+                    try:
+                        self.settings["monitor_index"] = 0
+                    except (TypeError, AttributeError):
+                        pass
+                    self.camera = dxcam.create(output_idx=0, output_color="BGR",
+                                               max_buffer_len=8)
+                else:
+                    raise
             self.camera.start(target_fps=fps)
         except Exception as exc:
             self.recording = False
@@ -1345,8 +1395,21 @@ class Recorder:
             except Exception:
                 pass
         fps = int(self.settings.get("fps", 60))
-        self.camera = dxcam.create(output_idx=self.monitor_index,
-                                   output_color="BGR", max_buffer_len=8)
+        try:
+            self.camera = dxcam.create(output_idx=self.monitor_index,
+                                       output_color="BGR", max_buffer_len=8)
+        except Exception:
+            if self.monitor_index != 0:
+                self.monitor_index = 0
+                try:
+                    self.settings["monitor_index"] = 0
+                except (TypeError, AttributeError):
+                    pass
+                self.camera = dxcam.create(output_idx=0,
+                                           output_color="BGR",
+                                           max_buffer_len=8)
+            else:
+                raise
         self.camera.start(target_fps=fps)
 
     def stop(self):

@@ -10,6 +10,73 @@ import subprocess
 
 from autostart import enable_autostart, disable_autostart, is_autostart_enabled
 
+try:
+    from fonts_loader import load_private_fonts as _load_private_fonts
+except (ImportError, OSError):
+    _load_private_fonts = None
+
+try:
+    import appicons as _appicons
+except (ImportError, OSError):
+    _appicons = None
+
+
+class _RowTip:
+    """Hover tooltip showing the app name on icon-only mixer rows."""
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = str(text or "")
+        self.tip = None
+        self._after = None
+        try:
+            widget.bind("<Enter>", self._schedule, add="+")
+            widget.bind("<Leave>", self._hide, add="+")
+            widget.bind("<Motion>", self._move, add="+")
+        except tk.TclError:
+            pass
+
+    def _schedule(self, _event):
+        self._hide()
+        if not self.text:
+            return
+        try:
+            self._after = self.widget.after(400, self._show)
+        except tk.TclError:
+            pass
+
+    def _show(self):
+        self._after = None
+        if self.tip is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 36
+            y = self.widget.winfo_rooty() - 4
+            self.tip = tk.Toplevel(self.widget)
+            self.tip.overrideredirect(True)
+            self.tip.attributes("-topmost", True)
+            self.tip.geometry("+%d+%d" % (x, y))
+            tb.Label(self.tip, text=self.text,
+                     font=("Supreme", 8)).pack()
+        except tk.TclError:
+            self.tip = None
+
+    def _move(self, _event):
+        pass
+
+    def _hide(self, _event=None):
+        try:
+            if self._after is not None:
+                self.widget.after_cancel(self._after)
+        except (tk.TclError, ValueError):
+            pass
+        self._after = None
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except tk.TclError:
+                pass
+            self.tip = None
+
 
 class BlacklineSlider(tk.Frame):
     """Volume slider with a guaranteed-visible fat black trough line.
@@ -25,10 +92,11 @@ class BlacklineSlider(tk.Frame):
     _HEIGHT = 26
     _TRACK_H = 5
     _THUMB_R = 10
-    _TRACK_EMPTY = "#5a5f66"  # light gray remainder past the handle
+    _TRACK_EMPTY = "#5a5f66"  # dim gray remainder past the handle
+    _TRACK_FILL = "#e8eaed"   # light gray fill (visible on dark themes)
 
     def __init__(self, parent, variable=None, from_=0, to=100, length=150,
-                 command=None, thumbcolor="#58a6ff", **kw):
+                 command=None, thumbcolor="#43484e", **kw):
         try:
             bg = parent.cget("background")
         except (tk.TclError, TypeError):
@@ -72,7 +140,7 @@ class BlacklineSlider(tk.Frame):
             img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
             draw.ellipse([3, 3, big - 3, big - 3],
-                         fill=thumbcolor, outline="#0b0e11", width=8)
+                         fill=thumbcolor, outline="#e8eaed", width=8)
             img = img.resize((r * 2 + 6, r * 2 + 6), Image.LANCZOS)
             return ImageTk.PhotoImage(img)
         except (ImportError, OSError, ValueError, tk.TclError):
@@ -106,7 +174,7 @@ class BlacklineSlider(tk.Frame):
             cx = pad + self._frac() * max(1, w - 2 * pad)
             if cx > pad + 1:
                 self.canvas.create_line(pad, y, cx, y,
-                                        fill="black", width=self._TRACK_H,
+                                        fill=self._TRACK_FILL, width=self._TRACK_H,
                                         capstyle="round")
             r = self._THUMB_R
             if self._ball is not None:
@@ -114,7 +182,7 @@ class BlacklineSlider(tk.Frame):
             else:
                 self.canvas.create_oval(cx - r, y - r, cx + r, y + r,
                                         fill=self._thumbcolor,
-                                        outline="#0b0e11", width=2)
+                                        outline="#e8eaed", width=2)
         except tk.TclError:
             pass
 
@@ -166,6 +234,321 @@ class BlacklineSlider(tk.Frame):
     def _release(self, _event):
         self.dragging = False
 
+
+def _shade_color(hexcolor, amount):
+    """Lighten (+) or darken (-) a #rrggbb color by amount (-100..100)."""
+    try:
+        h = str(hexcolor).lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+        def _clamp(v):
+            return max(0, min(255, v + amount))
+        return "#%02x%02x%02x" % (_clamp(r), _clamp(g), _clamp(b))
+    except (ValueError, TypeError, IndexError):
+        return hexcolor
+
+
+def _pill_palette(bootstyle):
+    """(background, foreground) for a pill button.
+
+    Primary is a fixed dark grey (theme blues are intentionally out);
+    secondary follows the theme. NOTE: Style.lookup() returns the wrong
+    (white) colors for colored ttkbootstrap button styles (verified);
+    Style.configure() has them.
+    """
+    boot = (bootstyle or "primary")
+    if boot == "primary":
+        return "#3a3f44", "#ffffff"
+    style_name = "%s.TButton" % boot
+    bg, fg = None, None
+    try:
+        st = tb.Style()
+        try:
+            opts = st.configure(style_name) or {}
+        except tk.TclError:
+            opts = {}
+        bg = opts.get("background") or None
+        fg = opts.get("foreground") or None
+    except (tk.TclError, AttributeError):
+        pass
+    if not bg:
+        bg = "#adb5bd" if style_name.startswith("secondary") else "#3a3f44"
+    if not fg:
+        fg = "#ffffff"
+    return bg, fg
+
+
+def _round_rect_points(x1, y1, x2, y2, radius, steps=6):
+    """Polygon points for a rounded rectangle (for Canvas create_polygon)."""
+    import math
+    radius = max(0, min(radius, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    pts = []
+    for cx, cy, start in ((x1 + radius, y1 + radius, 180),
+                          (x2 - radius, y1 + radius, 270),
+                          (x2 - radius, y2 - radius, 0),
+                          (x1 + radius, y2 - radius, 90)):
+        for i in range(steps + 1):
+            ang = math.radians(start + 90.0 * i / steps)
+            pts += [cx + radius * math.cos(ang), cy + radius * math.sin(ang)]
+    return pts
+
+
+class PillButton(tk.Canvas):
+    """Canvas-drawn pill button with fully rounded ends.
+
+    Same theme colors as the ttkbootstrap bootstyle; tk.Button-style
+    subset API (text/command/state/invoke/configure/cget) so call sites
+    barely change. Keyboard-operable (Tab focus, Enter/Space).
+    """
+
+    def __init__(self, parent, text="", command=None, bootstyle="primary",
+                 font=None, height=34, hpad=20, state="normal", **kw):
+        self._text = str(text)
+        self._command = command
+        self._bootstyle = bootstyle or "primary"
+        self._height = max(24, int(height))
+        self._hpad = max(8, int(hpad))
+        self._btn_state = "normal" if state == "normal" else "disabled"
+        self._hover = False
+        self._pressed = False
+        self._has_focus = False
+        if font is None:
+            try:
+                font = tb.Style().lookup("TButton", "font") or ("Supreme", 10, "bold")
+            except (tk.TclError, AttributeError):
+                font = ("Supreme", 10, "bold")
+        import tkinter.font as tkfont
+        self._font = font if isinstance(font, tkfont.Font) else tkfont.Font(font=font)
+        try:
+            bg = parent.cget("background")
+        except (tk.TclError, TypeError):
+            bg = "#060606"
+        kw.setdefault("background", bg)
+        kw.setdefault("highlightthickness", 0)
+        kw.setdefault("borderwidth", 0)
+        try:
+            req_w = max(60, self._font.measure(self._text) + 2 * self._hpad)
+        except (tk.TclError, TypeError):
+            req_w = 120
+        super().__init__(parent, height=self._height, width=req_w, **kw)
+        self.configure(takefocus=True)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Return>", lambda _e: self.invoke())
+        self.bind("<space>", lambda _e: self.invoke())
+        self.bind("<FocusIn>", lambda _e: self._set_focus(True))
+        self.bind("<FocusOut>", lambda _e: self._set_focus(False))
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.after_idle(self._draw)
+
+    def _fill_for_state(self):
+        bg, _fg = _pill_palette(self._bootstyle)
+        if self._btn_state == "disabled":
+            return "#b9bec4"
+        if self._pressed:
+            return _shade_color(bg, -32)
+        if self._hover:
+            return _shade_color(bg, 26)
+        return bg
+
+    def _draw(self):
+        try:
+            w = self.winfo_width()
+            h = self._height
+            if w < 10:
+                w = int(self.cget("width") or 120)
+            _bg, fg = _pill_palette(self._bootstyle)
+            if self._btn_state == "disabled":
+                fg = "#f0f0f0"
+            self.delete("all")
+            pts = _round_rect_points(1, 1, w - 1, h - 1, h // 2 - 1)
+            outline = "#0b0e11" if self._has_focus else _shade_color(self._fill_for_state(), -45)
+            self.create_polygon(pts, smooth=True, fill=self._fill_for_state(),
+                                outline=outline, width=2 if self._has_focus else 1)
+            self.create_text(w // 2, h // 2, text=self._text, fill=fg,
+                             font=self._font)
+        except tk.TclError:
+            pass
+
+    def _on_enter(self, _event):
+        if self._btn_state != "normal":
+            return
+        self._hover = True
+        try:
+            self.configure(cursor="hand2")
+        except tk.TclError:
+            pass
+        self._draw()
+
+    def _on_leave(self, _event):
+        self._hover = False
+        self._pressed = False
+        try:
+            self.configure(cursor="")
+        except tk.TclError:
+            pass
+        self._draw()
+
+    def _on_press(self, _event):
+        if self._btn_state != "normal":
+            return
+        self._pressed = True
+        try:
+            self.focus_set()
+        except tk.TclError:
+            pass
+        self._draw()
+
+    def _on_release(self, event):
+        was = self._pressed
+        self._pressed = False
+        self._draw()
+        if was and self._btn_state == "normal" and self._command is not None:
+            try:
+                inside = (0 <= event.x <= self.winfo_width()
+                          and 0 <= event.y <= self._height)
+            except tk.TclError:
+                inside = True
+            if inside:
+                try:
+                    self._command()
+                except tk.TclError:
+                    pass
+
+    def _set_focus(self, value):
+        self._has_focus = bool(value)
+        self._draw()
+
+    def invoke(self):
+        if self._btn_state == "normal" and self._command is not None:
+            try:
+                self._command()
+            except tk.TclError:
+                pass
+
+    def configure(self, **kw):
+        redraw = False
+        if "text" in kw:
+            self._text = str(kw.pop("text"))
+            redraw = True
+        if "command" in kw:
+            self._command = kw.pop("command")
+        if "state" in kw:
+            self._btn_state = "normal" if kw.pop("state") == "normal" else "disabled"
+            redraw = True
+        if "bootstyle" in kw:
+            self._bootstyle = kw.pop("bootstyle") or "primary"
+            redraw = True
+        if kw:
+            try:
+                super().configure(**kw)
+            except tk.TclError:
+                pass
+        if redraw:
+            self._draw()
+
+    config = configure
+
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        if key == "state":
+            return self._btn_state
+        if key == "command":
+            return self._command
+        if key == "bootstyle":
+            return self._bootstyle
+        try:
+            return super().cget(key)
+        except tk.TclError:
+            return None
+
+
+class RoundCard(tk.Frame):
+    """Rounded-corner card container. Content goes in `.inner`.
+
+    Drawn on a canvas (rounded fill + outline) so corners are truly
+    round — ttk frames cannot do this. Hug mode (fill=X rows) and
+    stretch mode (fill=BOTH+expand) both work via Configure handlers.
+    """
+
+    def __init__(self, parent, radius=18, outline="#bfbfbf", pad=10,
+                 title=None, title_font=("Supreme", 10, "bold"), **kw):
+        try:
+            bg = parent.cget("background")
+        except (tk.TclError, TypeError):
+            bg = "#060606"
+        kw.setdefault("highlightthickness", 0)
+        kw.setdefault("borderwidth", 0)
+        super().__init__(parent, background=bg, **kw)
+        self._radius = max(4, int(radius))
+        self._outline = outline
+        self._pad = max(0, int(pad))
+        try:
+            fill = tb.Style().lookup("TFrame", "background") or "#060606"
+        except (tk.TclError, AttributeError):
+            fill = "#060606"
+        self._fill = fill
+        self._bg = bg
+        self.canvas = tk.Canvas(self, background=bg, highlightthickness=0,
+                                borderwidth=0)
+        self.canvas.pack(fill=BOTH, expand=True)
+        self.inner = tb.Frame(self.canvas)
+        self._win = self.canvas.create_window(self._pad, self._pad,
+                                              window=self.inner, anchor="nw")
+        if title is not None:
+            tb.Label(self.inner, text=title,
+                     font=title_font).pack(anchor=W, pady=(0, 4))
+        self.canvas.bind("<Configure>", lambda _e: self._layout())
+        try:
+            self.inner.bind("<Configure>", lambda _e: self._fit())
+        except tk.TclError:
+            pass
+        self.after_idle(self._fit)
+
+    def _layout(self):
+        try:
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            if cw < 10 or ch < 10:
+                return
+            # NOTE: delete "card" only — delete("all") would destroy the
+            # embedded .inner window item and blank the card's content.
+            self.canvas.delete("card")
+            pts = _round_rect_points(1, 1, cw - 1, ch - 1, self._radius)
+            self.canvas.create_polygon(pts, smooth=True, fill=self._fill,
+                                       outline=self._outline, width=1,
+                                       tags=("card",))
+            # Card shape must sit BEHIND the embedded .inner window.
+            try:
+                self.canvas.tag_lower("card", self._win)
+            except tk.TclError:
+                pass
+            try:
+                req_h = self.inner.winfo_reqheight()
+            except tk.TclError:
+                req_h = 0
+            self.canvas.itemconfigure(
+                self._win, width=max(10, cw - 2 * self._pad),
+                height=max(req_h, ch - 2 * self._pad))
+        except tk.TclError:
+            pass
+
+    def _fit(self):
+        try:
+            want_w = self.inner.winfo_reqwidth() + 2 * self._pad
+            want_h = self.inner.winfo_reqheight() + 2 * self._pad
+            cur_w = int(self.canvas.cget("width") or 0)
+            cur_h = int(self.canvas.cget("height") or 0)
+            if want_w != cur_w or want_h != cur_h:
+                self.canvas.configure(width=max(10, want_w),
+                                      height=max(10, want_h))
+        except (tk.TclError, ValueError):
+            pass
+        self._layout()
+
 try:
     import pystray
     from PIL import Image, ImageDraw
@@ -182,6 +565,14 @@ try:
 except (ImportError, OSError):
     get_monitors = None
     _HAVE_SCREENINFO = False
+
+try:
+    from settings import SETTINGS_PATH as _SETTINGS_PATH, save_settings as _save_settings_file
+    _HAVE_SETTINGS_IO = True
+except (ImportError, OSError):
+    _SETTINGS_PATH = None
+    _save_settings_file = None
+    _HAVE_SETTINGS_IO = False
 
 try:
     import appmixer
@@ -272,7 +663,46 @@ class UI:
         self.settings = recorder.settings
 
         self.root.title("KillCam+")
-        self.root.geometry("460x520")
+        self.root.geometry("460x570")
+
+        # Bundled Supreme (private per-process font, no install needed).
+        # Must run before any widget is created so Tk resolves the family.
+        if _load_private_fonts is not None:
+            try:
+                _load_private_fonts()
+            except Exception:
+                pass
+
+        # Dark theme (near-black "cyborg"): applied once before any widget
+        # is created so every themed widget picks it up at creation time.
+        try:
+            _style = tb.Style("cyborg")
+        except tk.TclError:
+            _style = None
+        # Supreme everywhere, including widgets without an explicit font
+        # (comboboxes, notebook tabs, entries, menus).
+        try:
+            import tkinter.font as _tkfont
+            for _fname in ("TkDefaultFont", "TkTextFont", "TkHeadingFont",
+                           "TkCaptionFont", "TkSmallCaptionFont",
+                           "TkIconFont", "TkMenuFont", "TkTooltipFont"):
+                try:
+                    _tkfont.Font(name=_fname, exists=True).configure(
+                        family="Supreme")
+                except tk.TclError:
+                    pass
+            if _style is not None:
+                _style.configure(".", font=("Supreme", 10))
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            _root_bg = tb.Style().lookup("TFrame", "background") or "#060606"
+        except (tk.TclError, AttributeError):
+            _root_bg = "#060606"
+        try:
+            self.root.configure(background=_root_bg)
+        except tk.TclError:
+            pass
 
         # Official window icon from the bundled icons/ folder
         try:
@@ -375,12 +805,9 @@ class UI:
         self.settings["system_volume"] = self.system_volume_var.get()
         self.recorder.mic_volume = self.settings["mic_volume"]
         self.recorder.system_volume = self.settings["system_volume"]
-        try:
-            mon_idx = self.monitor_indices[
-                self.monitor_labels().index(self.monitor_var.get())] \
-                if self.monitor_var.get() else 0
-        except (ValueError, IndexError, AttributeError):
-            mon_idx = int(self.settings.get("monitor_index", 0))
+        # Read the user's pick directly: rebuilding labels first would
+        # snap the variable back to the saved value and discard the pick.
+        mon_idx = self._selected_monitor_index()
         monitor_changed = (mon_idx != self.recorder.monitor_index)
         self.settings["monitor_index"] = mon_idx
         self.recorder.monitor_index = mon_idx
@@ -400,11 +827,28 @@ class UI:
 
         self.settings["start_with_windows"] = bool(self.autostart_var.get())
 
-        import json
-        settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(self.settings, f, indent=4)
-        self.recorder._reset_buffer_size()
+        # Frozen exe: settings live next to the exe (SETTINGS_PATH), not
+        # next to the bundled source (dirname(__file__) is _internal).
+        # Writing to the wrong path saves "successfully" but the next
+        # launch loads stale values.
+        try:
+            if _HAVE_SETTINGS_IO and _SETTINGS_PATH:
+                ok = bool(_save_settings_file(self.settings, _SETTINGS_PATH))
+            else:
+                import json
+                from settings import SETTINGS_PATH as _sp
+                with open(_sp, "w", encoding="utf-8") as f:
+                    json.dump(self.settings, f, indent=4)
+                ok = True
+        except (OSError, ValueError, TypeError):
+            ok = False
+        if not ok:
+            self.notify("Could not save settings.")
+            return False
+        try:
+            self.recorder._reset_buffer_size()
+        except (ValueError, TypeError, AttributeError):
+            pass
         return True
 
     def _schedule_settings_save(self, delay_ms=400):
@@ -430,7 +874,7 @@ class UI:
         self._save_after_id = None
         try:
             self.save_settings()
-        except (tk.TclError, ValueError, OSError):
+        except Exception:
             pass
 
     # ---------------------------------------------------
@@ -442,32 +886,55 @@ class UI:
         toast.attributes("-topmost", True)
 
         screen_width = toast.winfo_screenwidth()
-        width = 163
-        height = 44
+        width = 180
+        height = 52
         x = screen_width - width - 20
         y = 20
 
         toast.geometry(f"{width}x{height}+{x}+{y}")
         toast.configure(bg="black")
 
-        frame = tk.Frame(toast, bg="black",
-                         highlightbackground="#3a3a3a", highlightthickness=1)
-        frame.pack(fill="both", expand=True)
-        label = tk.Label(frame, text=message, font=("Segoe UI", 10),
-                         bg="black", fg="white", wraplength=145,
-                         justify="center")
-        label.pack(fill="both", expand=True)
-        # Re-assert after mapping: the ttkbootstrap theme overrides
-        # classic-tk colors at creation time; post-creation configure
-        # sticks (verified).
+        # Rounded pill toast: black-on-black canvas so the window's square
+        # corners disappear and only the rounded bubble shows.
+        canvas = tk.Canvas(toast, width=width, height=height, bg="black",
+                           highlightthickness=0, borderwidth=0)
+        canvas.pack(fill="both", expand=True)
         try:
-            frame.configure(bg="black")
-            label.configure(bg="black", fg="white")
+            pts = _round_rect_points(2, 2, width - 2, height - 2, (height - 4) // 2)
+            canvas.create_polygon(pts, smooth=True, fill="black",
+                                  outline="#3a3a3a", width=1)
+            canvas.create_text(width // 2, height // 2, text=message,
+                               font=("Supreme", 10), fill="white",
+                               width=150, justify="center")
             toast.update_idletasks()
         except tk.TclError:
             pass
 
         toast.after(duration, toast.destroy)
+
+    def _load_ui_icon(self, name, height=18):
+        """Small white UI icon from icons/ (same dir as the window icon,
+        so frozen + source runs agree). None when unavailable."""
+        try:
+            icon_dir = None
+            try:
+                base_icon = self.recorder.icon_path()
+                if base_icon:
+                    icon_dir = os.path.dirname(base_icon)
+            except (AttributeError, OSError, TypeError):
+                icon_dir = None
+            if not icon_dir:
+                icon_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "icons")
+            from PIL import Image, ImageTk
+            img = Image.open(
+                os.path.join(icon_dir, name)).convert("RGBA")
+            width = max(1, round(img.width * height / img.height))
+            return ImageTk.PhotoImage(img.resize((width, height),
+                                                 Image.LANCZOS))
+        except (OSError, ValueError, ImportError, tk.TclError,
+                AttributeError):
+            return None
 
     # ---------------------------------------------------
     # UI Layout
@@ -476,34 +943,63 @@ class UI:
         main_frame = tb.Frame(self.root, padding=10)
         main_frame.pack(fill=BOTH, expand=True)
 
+        # ---- Header: logo + title ----
+        header = tb.Frame(main_frame)
+        header.pack(fill=X, pady=(0, 8))
+        self._logo_photo = None
+        try:
+            from PIL import Image, ImageTk
+            _icon_path = self.recorder.icon_path()
+            if _icon_path:
+                _logo = Image.open(_icon_path).convert("RGBA").resize(
+                    (30, 30), Image.LANCZOS)
+                self._logo_photo = ImageTk.PhotoImage(_logo)
+                tb.Label(header,
+                         image=self._logo_photo).pack(side=LEFT, padx=(2, 8))
+        except (OSError, ValueError, ImportError, tk.TclError,
+                AttributeError):
+            pass
+        tb.Label(header, text="KillCam+",
+                 font=("Supreme", 16, "bold")).pack(side=LEFT)
+
         notebook = tb.Notebook(main_frame, bootstyle="dark")
         notebook.pack(fill=BOTH, expand=True)
 
         recording_tab = tb.Frame(notebook, padding=10)
         settings_tab = tb.Frame(notebook, padding=10)
         hotkeys_tab = tb.Frame(notebook, padding=10)
-        output_tab = tb.Frame(notebook, padding=10)
         about_tab = tb.Frame(notebook, padding=10)
 
         notebook.add(recording_tab, text="Recording")
         notebook.add(settings_tab, text="Settings")
         notebook.add(hotkeys_tab, text="Hotkeys")
-        notebook.add(output_tab, text="Output")
         notebook.add(about_tab, text="About")
 
+        # Rounded cards behind each tab page (content parents below point
+        # at .inner so the pages themselves get truly round corners).
+        rec_card = RoundCard(recording_tab, radius=18)
+        rec_card.pack(fill=BOTH, expand=True)
+        set_card = RoundCard(settings_tab, radius=18)
+        set_card.pack(fill=BOTH, expand=True)
+        hk_card = RoundCard(hotkeys_tab, radius=18)
+        hk_card.pack(fill=BOTH, expand=True)
+        abt_card = RoundCard(about_tab, radius=18)
+        abt_card.pack(fill=BOTH, expand=True)
+
         # ---- Recording Tab ----
-        tb.Label(recording_tab, text="Replay Buffer (seconds):").pack(anchor=W)
+        tb.Label(rec_card.inner, text="Replay Buffer (seconds):").pack(anchor=W)
         tb.Combobox(
-            recording_tab, textvariable=self.buffer_var,
+            rec_card.inner, textvariable=self.buffer_var,
             values=["5", "10", "15", "20", "30", "45", "60", "90", "120"],
             state="readonly", width=10,
         ).pack(anchor=W, pady=(0, 8))
 
         # Video preview + audio levels
-        preview_frame = tb.Labelframe(recording_tab, text="Preview")
-        preview_frame.pack(fill=BOTH, expand=True, pady=(0, 5))
+        preview_card = RoundCard(rec_card.inner, radius=14, pad=8,
+                                 title="Preview")
+        preview_card.pack(fill=BOTH, expand=True, pady=(0, 5))
 
-        self.preview_canvas = tk.Canvas(preview_frame, bg="#0d1117", highlightthickness=0)
+        self.preview_canvas = tk.Canvas(preview_card.inner, bg="#0d1117", highlightthickness=0)
         self.preview_canvas.pack(fill=BOTH, expand=True)
 
         # Smoothed audio levels (EMA)
@@ -512,8 +1008,13 @@ class UI:
 
         # ---- Settings Tab ----
         # Scrollable container for settings
-        settings_canvas = tk.Canvas(settings_tab, highlightthickness=0)
-        settings_scrollbar = tb.Scrollbar(settings_tab, orient="vertical", command=settings_canvas.yview)
+        try:
+            _set_bg = tb.Style().lookup("TFrame", "background") or "#060606"
+        except (tk.TclError, AttributeError):
+            _set_bg = "#060606"
+        settings_canvas = tk.Canvas(set_card.inner, highlightthickness=0,
+                                    background=_set_bg, borderwidth=0)
+        settings_scrollbar = tb.Scrollbar(set_card.inner, orient="vertical", command=settings_canvas.yview)
         settings_inner = tb.Frame(settings_canvas)
         settings_inner.bind("<Configure>", lambda e: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")))
         settings_canvas.create_window((0, 0), window=settings_inner, anchor="nw")
@@ -522,56 +1023,65 @@ class UI:
         settings_canvas.pack(fill=BOTH, expand=True)
 
         # Recording toggle
-        tb.Label(settings_inner, text="Recording", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(0, 4))
+        tb.Label(settings_inner, text="Recording", font=("Supreme", 10, "bold")).pack(anchor=W, pady=(0, 4))
         tb.Label(settings_inner, text="Microphone is always recording; mute it with the volume slider or hotkey.",
-                 font=("Segoe UI", 8), foreground="#8b949e", wraplength=380,
+                 font=("Supreme", 8), foreground="#8b949e", wraplength=380,
                  justify=LEFT).pack(anchor=W, pady=(0, 6))
 
         # Audio devices
-        tb.Label(settings_inner, text="Audio Devices", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(8, 4))
+        tb.Label(settings_inner, text="Audio Devices", font=("Supreme", 10, "bold")).pack(anchor=W, pady=(8, 4))
         tb.Label(settings_inner, text="Microphone input:").pack(anchor=W)
         self.mic_device_box = tb.Combobox(
             settings_inner, textvariable=self.mic_device_var,
-            values=[self.mic_device_var.get()], state="readonly", width=36,
+            values=[self.mic_device_var.get()], state="readonly", width=32,
             postcommand=self.refresh_audio_devices)
         self.mic_device_box.pack(anchor=W, pady=(0, 6))
 
         tb.Label(settings_inner, text="System-audio input:").pack(anchor=W)
         self.system_device_box = tb.Combobox(
             settings_inner, textvariable=self.system_device_var,
-            values=[self.system_device_var.get()], state="readonly", width=36,
+            values=[self.system_device_var.get()], state="readonly", width=32,
             postcommand=self.refresh_audio_devices)
         self.system_device_box.pack(anchor=W, pady=(0, 4))
-        self.audio_status = tb.Label(settings_inner, text="", foreground="red", font=("Segoe UI", 9))
+        self.audio_status = tb.Label(settings_inner, text="", foreground="red", font=("Supreme", 9))
         self.audio_status.pack(anchor=W, pady=(0, 6))
 
         # Volume sliders
-        tb.Label(settings_inner, text="Volume", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(8, 4))
+        tb.Label(settings_inner, text="Volume", font=("Supreme", 10, "bold")).pack(anchor=W, pady=(8, 4))
+
+        self._mic_icon = self._load_ui_icon("mic.png")
+        self._sys_icon = self._load_ui_icon("speaker.png")
 
         mic_vol_frame = tb.Frame(settings_inner)
         mic_vol_frame.pack(fill=X, pady=(0, 2))
+        if self._mic_icon is not None:
+            tb.Label(mic_vol_frame,
+                     image=self._mic_icon).pack(side=LEFT, padx=(0, 6))
         tb.Label(mic_vol_frame, text="Microphone:").pack(side=LEFT)
-        self.mic_vol_label = tb.Label(mic_vol_frame, text=f"{self.mic_volume_var.get()}%", width=4)
+        self.mic_vol_label = tb.Label(mic_vol_frame, text=f"{self.mic_volume_var.get()}%", width=5)
         self.mic_vol_label.pack(side=RIGHT)
         self.mic_vol_slider = BlacklineSlider(
             settings_inner, variable=self.mic_volume_var, from_=0, to=100,
-            thumbcolor="#58a6ff",
+            thumbcolor="#43484e",
             command=lambda v: self._on_mic_volume_change(v))
         self.mic_vol_slider.pack(fill=X, pady=(0, 6))
 
         sys_vol_frame = tb.Frame(settings_inner)
         sys_vol_frame.pack(fill=X, pady=(0, 2))
+        if self._sys_icon is not None:
+            tb.Label(sys_vol_frame,
+                     image=self._sys_icon).pack(side=LEFT, padx=(0, 6))
         tb.Label(sys_vol_frame, text="System:").pack(side=LEFT)
-        self.sys_vol_label = tb.Label(sys_vol_frame, text=f"{self.system_volume_var.get()}%", width=4)
+        self.sys_vol_label = tb.Label(sys_vol_frame, text=f"{self.system_volume_var.get()}%", width=5)
         self.sys_vol_label.pack(side=RIGHT)
         self.sys_vol_slider = BlacklineSlider(
             settings_inner, variable=self.system_volume_var, from_=0, to=100,
-            thumbcolor="#d29922",
+            thumbcolor="#43484e",
             command=lambda v: self._on_system_volume_change(v))
         self.sys_vol_slider.pack(fill=X, pady=(0, 6))
 
         # Video settings
-        tb.Label(settings_inner, text="Video", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(8, 4))
+        tb.Label(settings_inner, text="Video", font=("Supreme", 10, "bold")).pack(anchor=W, pady=(8, 4))
 
         fps_frame = tb.Frame(settings_inner)
         fps_frame.pack(fill=X, pady=(0, 4))
@@ -596,7 +1106,8 @@ class UI:
         tb.Label(mon_frame, text="Monitor:").pack(side=LEFT)
         self.monitor_box = tb.Combobox(
             mon_frame, textvariable=self.monitor_var,
-            values=self.monitor_labels(), state="readonly", width=28,
+            values=self._sync_monitor_var(), state="readonly", width=23,
+            postcommand=self.refresh_monitor_box,
         )
         self.monitor_box.pack(side=LEFT, padx=(8, 0))
         self.monitor_box.bind("<<ComboboxSelected>>", lambda _e: self.on_monitor_selected())
@@ -615,7 +1126,8 @@ class UI:
                  "Medium: Medium performance/Medium quality loss (Mid-range machines)\n"
                  "Low: Worse Performance/Almost 0 quality loss (High-end machines)\n"
                  "Applies on restart.",
-            font=("Segoe UI", 8), foreground="#8b949e",
+            font=("Supreme", 8), foreground="#8b949e",
+            wraplength=360, justify=LEFT,
         ).pack(anchor=W, pady=(0, 4))
 
         # Audio mode
@@ -626,13 +1138,13 @@ class UI:
         ).pack(anchor=W, pady=(0, 6))
 
         # Per-app volume mixer
-        tb.Label(settings_inner, text="App Volumes", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(8, 4))
+        tb.Label(settings_inner, text="App Volumes", font=("Supreme", 10, "bold")).pack(anchor=W, pady=(8, 4))
         if _HAVE_MIXER:
             tb.Label(
                 settings_inner,
                 text="Clip-only levels: Windows volumes are never touched.\n"
                      "Per-app gains apply inside the recording pipeline.",
-                font=("Segoe UI", 8), foreground="#8b949e",
+                font=("Supreme", 8), foreground="#8b949e",
             ).pack(anchor=W, pady=(0, 4))
             self.app_mixer_frame = tb.Frame(settings_inner)
             self.app_mixer_frame.pack(fill=X, pady=(0, 6))
@@ -640,49 +1152,52 @@ class UI:
             tb.Label(
                 settings_inner,
                 text="Per-app mixer unavailable (pycaw not installed).",
-                font=("Segoe UI", 8), foreground="#8b949e",
+                font=("Supreme", 8), foreground="#8b949e",
             ).pack(anchor=W, pady=(0, 6))
             self.app_mixer_frame = None
 
         # Autostart
-        tb.Label(settings_inner, text="System", font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(8, 4))
+        tb.Label(settings_inner, text="System", font=("Supreme", 10, "bold")).pack(anchor=W, pady=(8, 4))
         tb.Checkbutton(
             settings_inner, text="Start KillCam+ with Windows",
             variable=self.autostart_var, bootstyle="round-toggle",
             command=self.on_autostart_toggle,
         ).pack(anchor=W, pady=(0, 6))
 
-        # ---- Hotkeys Tab ----
-        tb.Label(hotkeys_tab, text="Global Hotkeys", font=("Segoe UI", 14, "bold")).pack(anchor=CENTER, pady=(0, 15))
-        self.add_hotkey_editor(hotkeys_tab, "Save Clip", self.hk_save, "save_clip")
-        self.add_hotkey_editor(hotkeys_tab, "Toggle Mic", self.hk_mic, "toggle_mic")
-        self.add_hotkey_editor(hotkeys_tab, "Toggle System Audio", self.hk_sys, "toggle_system_audio")
-
-        # ---- Output Tab ----
-        tb.Label(output_tab, text="Save Folder:").pack(anchor=W)
-        folder_frame = tb.Frame(output_tab)
+        # Output (save folder lives in Settings now; no Output tab)
+        tb.Label(settings_inner, text="Output", font=("Supreme", 10, "bold")).pack(anchor=W, pady=(8, 4))
+        tb.Label(settings_inner, text="Save Folder:").pack(anchor=W)
+        folder_frame = tb.Frame(settings_inner)
         folder_frame.pack(fill=X, pady=(0, 10))
         self.folder_box = tb.Combobox(
             folder_frame, textvariable=self.save_folder_var,
-            values=self.output_folders(), state="readonly", width=35,
+            values=self.output_folders(), state="readonly", width=28,
             postcommand=self.refresh_output_folders)
         self.folder_box.pack(side=LEFT, fill=X, expand=True)
-        tb.Button(folder_frame, text="Browse", command=self.choose_folder).pack(side=LEFT, padx=5)
+        PillButton(folder_frame, text="Browse", command=self.choose_folder).pack(side=LEFT, padx=5)
+
+        # ---- Hotkeys Tab ----
+        tb.Label(hk_card.inner, text="Global Hotkeys", font=("Supreme", 14, "bold")).pack(anchor=CENTER, pady=(0, 15))
+        self.add_hotkey_editor(hk_card.inner, "Save Clip", self.hk_save, "save_clip")
+        self.add_hotkey_editor(hk_card.inner, "Toggle Mic", self.hk_mic, "toggle_mic")
+        self.add_hotkey_editor(hk_card.inner, "Toggle System Audio", self.hk_sys, "toggle_system_audio")
 
         # ---- About Tab ----
-        tb.Label(about_tab, text="KillCam+", font=("Segoe UI", 18, "bold")).pack(pady=10)
-        tb.Label(about_tab, text="v 0.0.1", font=("Segoe UI", 10)).pack(pady=(0, 6))
+        tb.Label(abt_card.inner, text="KillCam+", font=("Supreme", 18, "bold")).pack(pady=10)
+        tb.Label(abt_card.inner, text="v2.0.0", font=("Supreme", 10)).pack(pady=(0, 6))
         tb.Label(
-            about_tab,
-            text="Light-weight clipping software\nMade by TGS\nPowered by KillCam+",
+            abt_card.inner,
+            text="Light-weight clipping software\nMade by TGS",
             justify=CENTER,
         ).pack()
+        PillButton(abt_card.inner, text="All versions", bootstyle="primary",
+                   command=lambda: self.open_releases_page()).pack(pady=(10, 0))
 
         # ---- Bottom controls ----
         controls = tb.Frame(main_frame)
         controls.pack(fill=X, pady=(10, 0))
-        tb.Button(controls, text="Save clip now", bootstyle="primary", command=self.save_clip).pack(side=LEFT, padx=8)
-        self.stream_status = tb.Label(controls, text="", font=("Consolas", 8), foreground="#8b949e")
+        PillButton(controls, text="Save clip", bootstyle="primary", command=self.save_clip).pack(side=LEFT, padx=8)
+        self.stream_status = tb.Label(controls, text="", font=("Supreme", 8), foreground="#8b949e")
         self.stream_status.pack(side=LEFT, padx=8)
 
         # ---- Wiring ----
@@ -696,6 +1211,7 @@ class UI:
         self.root.after(10_000, self.schedule_device_refresh)
         self.root.after(500, self.update_preview)
         self.root.after(500, self.schedule_app_mixer_poll)
+        self.root.after(5000, self.refresh_monitor_box)
         # Explicit engine sync at startup: push every persisted volume
         # into the recorder + labels so UI, engine, and file agree from
         # frame one, regardless of construction order.
@@ -776,7 +1292,7 @@ class UI:
                     canvas.create_image(w // 2, int(h * 0.38), image=self._preview_photo, anchor=CENTER)
                 else:
                     canvas.create_text(w // 2, int(h * 0.35), text="Starting...",
-                                       fill="#484f58", font=("Segoe UI", 11))
+                                       fill="#484f58", font=("Supreme", 11))
 
                 # --- Smoothed audio level bars ---
                 alpha = 0.3  # EMA smoothing (lower = smoother, 0.1-0.4 good range)
@@ -797,28 +1313,28 @@ class UI:
                 # Mic bar
                 mic_y = int(h * 0.82)
                 canvas.create_text(bar_x, mic_y - 8, text="MIC",
-                                   fill="#58a6ff", font=("Consolas", 8), anchor=W)
+                                   fill="#adb5bd", font=("Supreme", 8), anchor=W)
                 canvas.create_rectangle(bar_x, mic_y, bar_x + bar_w, mic_y + bar_h,
                                         fill="#161b22", outline="#30363d")
                 fill_w = int(bar_w * mic_pct)
                 canvas.create_rectangle(bar_x, mic_y, bar_x + fill_w, mic_y + bar_h,
-                                        fill="#58a6ff", outline="")
+                                        fill="#adb5bd", outline="")
 
                 # System bar
                 sys_y = mic_y + gap
                 canvas.create_text(bar_x, sys_y - 8, text="SYS",
-                                   fill="#d29922", font=("Consolas", 8), anchor=W)
+                                   fill="#adb5bd", font=("Supreme", 8), anchor=W)
                 canvas.create_rectangle(bar_x, sys_y, bar_x + bar_w, sys_y + bar_h,
                                         fill="#161b22", outline="#30363d")
                 fill_w = int(bar_w * sys_pct)
                 canvas.create_rectangle(bar_x, sys_y, bar_x + fill_w, sys_y + bar_h,
-                                        fill="#d29922", outline="")
+                                        fill="#adb5bd", outline="")
             else:
                 canvas.configure(bg="#1a1a2e")
                 self._smooth_mic = 0.0
                 self._smooth_sys = 0.0
                 canvas.create_text(w // 2, h // 2, text="Not Recording",
-                                   fill="#484f58", font=("Segoe UI", 12))
+                                   fill="#484f58", font=("Supreme", 12))
 
         except Exception:
             pass
@@ -854,8 +1370,33 @@ class UI:
     # ---------------------------------------------------
     # Monitor selection
     # ---------------------------------------------------
-    def monitor_labels(self):
-        """Dropdown labels for connected displays; indices align with dxcam."""
+    def _enumerate_monitors(self):
+        """[(dxcam_idx, w, h, primary)] in dxcam order.
+
+        Labels must follow dxcam.output_info() ordering: screeninfo
+        enumerates differently (here it lists the 1920x1200 panel
+        first while dxcam puts the 1920x1080 primary at Output[0]),
+        so screeninfo order is only a fallback when dxcam is
+        unreachable.
+        """
+        import re
+        try:
+            import dxcam as _dxcam
+            info = str(_dxcam.output_info())
+            found = []
+            for line in info.splitlines():
+                m = re.search(
+                    r"Output\[(\d+)\].*?Res:\((\d+)\s*,\s*(\d+)\).*?"
+                    r"Primary:(True|False)", line)
+                if m:
+                    found.append((int(m.group(1)), int(m.group(2)),
+                                  int(m.group(3)),
+                                  m.group(4) == "True"))
+            if found:
+                found.sort(key=lambda t: t[0])
+                return found
+        except Exception:
+            pass
         try:
             if _HAVE_SCREENINFO:
                 monitors = list(get_monitors())
@@ -863,27 +1404,100 @@ class UI:
                 monitors = []
         except Exception:
             monitors = []
-        if not monitors:
-            self.monitor_indices = [max(0, int(self.settings.get("monitor_index", 0)))]
-            return ["Monitor %d" % (self.monitor_indices[0] + 1)]
-        labels = []
-        self.monitor_indices = list(range(len(monitors)))
+        out = []
         for i, mon in enumerate(monitors):
-            tag = "primary" if getattr(mon, "is_primary", False) else "secondary"
-            labels.append("Monitor %d: %dx%d (%s)" % (i + 1, mon.width, mon.height, tag))
-        idx = max(0, int(self.settings.get("monitor_index", 0)))
-        if idx < len(labels):
-            self.monitor_var.set(labels[idx])
-        else:
-            self.monitor_var.set(labels[0])
+            try:
+                out.append((i, int(mon.width), int(mon.height),
+                            bool(getattr(mon, "is_primary", i == 0))))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return out
+
+    def monitor_labels(self):
+        """Dropdown labels; pure (never touches monitor_var).
+
+        Callers sync the variable explicitly so reading the user's
+        pick can never be clobbered by a refresh.
+        """
+        monitors = self._enumerate_monitors()
+        if not monitors:
+            try:
+                idx = max(0, int(self.settings.get("monitor_index", 0)))
+            except (ValueError, TypeError):
+                idx = 0
+            self.monitor_indices = [idx]
+            return ["Monitor %d" % (idx + 1)]
+        labels = []
+        self.monitor_indices = [m[0] for m in monitors]
+        for pos, (_idx, w, h, primary) in enumerate(monitors):
+            tag = "primary" if primary else "secondary"
+            labels.append("Monitor %d: %dx%d (%s)"
+                          % (pos + 1, w, h, tag))
         return labels
 
-    def on_monitor_selected(self):
+    def _sync_monitor_var(self):
+        """Point monitor_var at the saved index (init + hotplug refresh)."""
+        labels = self.monitor_labels()
         try:
-            idx = self.monitor_labels().index(self.monitor_var.get())
-            monitor_idx = self.monitor_indices[idx]
+            want = max(0, int(self.settings.get("monitor_index", 0)))
+        except (ValueError, TypeError):
+            want = 0
+        try:
+            pos = self.monitor_indices.index(want)
+        except ValueError:
+            pos = 0
+        try:
+            self.monitor_var.set(labels[pos])
+        except (tk.TclError, IndexError):
+            pass
+        return labels
+
+    def refresh_monitor_box(self):
+        """Hotplug refresh that preserves the user's current pick."""
+        try:
+            current = self.monitor_var.get()
+        except tk.TclError:
+            current = ""
+        labels = self.monitor_labels()
+        try:
+            self.monitor_box.configure(values=labels)
+        except (tk.TclError, AttributeError):
+            pass
+        if current in labels:
+            try:
+                self.monitor_var.set(current)
+            except tk.TclError:
+                pass
+        else:
+            self._sync_monitor_var()
+        try:
+            self.root.after(5000, self.refresh_monitor_box)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _selected_monitor_index(self):
+        """Read the user's pick WITHOUT rebuilding labels first."""
+        try:
+            current = self.monitor_var.get()
+        except tk.TclError:
+            current = ""
+        if not current:
+            try:
+                return max(0, int(self.settings.get("monitor_index", 0)))
+            except (ValueError, TypeError):
+                return 0
+        try:
+            labels = self.monitor_labels()
+            pos = labels.index(current)
+            return self.monitor_indices[pos]
         except (ValueError, IndexError, AttributeError):
-            return
+            try:
+                return max(0, int(self.settings.get("monitor_index", 0)))
+            except (ValueError, TypeError):
+                return 0
+
+    def on_monitor_selected(self):
+        monitor_idx = self._selected_monitor_index()
         self.settings["monitor_index"] = monitor_idx
         self.recorder.monitor_index = monitor_idx
         self.save_settings()
@@ -957,6 +1571,13 @@ class UI:
             labels = {}
         for exe in sorted(set(saved) - set(live)):
             labels.setdefault(exe, exe)
+        pids = {}
+        try:
+            for a in apps:
+                if a.get("exe") in shown and a.get("pid"):
+                    pids.setdefault(a["exe"], a["pid"])
+        except (TypeError, KeyError, AttributeError):
+            pids = {}
         # Displayed value = clip-gain intent (persisted), defaulting to
         # 100% for newly detected apps. Never the live system level
         # (otherwise the poll snaps the handle back after every drag,
@@ -974,7 +1595,7 @@ class UI:
             self._app_rows.clear()
             for exe in sorted(display, key=str.casefold):
                 self._make_app_row(frame, exe, labels.get(exe, exe),
-                                   display[exe])
+                                   display[exe], pid=pids.get(exe))
         else:
             # Same apps: refresh handles to intent (skip mid-drag)
             for exe, (row, var, slider, pct) in self._app_rows.items():
@@ -986,18 +1607,44 @@ class UI:
                 except (tk.TclError, KeyError):
                     pass
 
-    def _make_app_row(self, parent, exe, label, volume):
+    def _make_app_row(self, parent, exe, label, volume, pid=None):
         row = tb.Frame(parent)
         row.pack(fill=X, pady=(0, 2))
-        tb.Label(row, text=label, width=22, anchor=W,
-                 font=("Consolas", 8)).pack(side=LEFT)
-        pct = tb.Label(row, text="%d%%" % volume, width=4,
-                       font=("Consolas", 8))
+        photo = None
+        if pid and _appicons is not None:
+            try:
+                bg = tb.Style().lookup("TFrame", "background") or "#060606"
+            except (tk.TclError, AttributeError):
+                bg = "#060606"
+            try:
+                photo = _appicons.get_icon_for_pid(pid, bg=bg)
+            except Exception:
+                photo = None
+        if photo is not None:
+            # Icon instead of the name; the name lives in a hover tooltip.
+            row._icon_photo = photo  # keep the Tk reference
+            icon_label = tb.Label(row, image=photo)
+            icon_label.pack(side=LEFT, padx=(0, 8))
+            _RowTip(icon_label, label)
+        else:
+            sys_icon = getattr(self, "_sys_icon", None)
+            if (sys_icon is not None
+                    and str(exe).strip().lower() == "system sounds"):
+                # System-audio mixer row: speaker icon, name in tooltip.
+                row._icon_photo = sys_icon
+                sys_label = tb.Label(row, image=sys_icon)
+                sys_label.pack(side=LEFT, padx=(0, 8))
+                _RowTip(sys_label, label)
+            else:
+                tb.Label(row, text=label, width=18, anchor=W,
+                         font=("Supreme", 8)).pack(side=LEFT)
+        pct = tb.Label(row, text="%d%%" % volume, width=5,
+                       font=("Supreme", 8))
         pct.pack(side=RIGHT)
         var = tk.IntVar(value=volume)
         slider = BlacklineSlider(
             row, variable=var, from_=0, to=100, length=150,
-            thumbcolor="#58a6ff",
+            thumbcolor="#43484e",
             command=lambda v, e=exe, p=pct: self._on_app_volume_change(e, v, p))
         slider.pack(side=RIGHT, padx=(0, 6), fill=X, expand=True)
         # Explicit read-then-set: handle follows the stored value.
@@ -1180,12 +1827,13 @@ class UI:
     # Hotkey editor row
     # ---------------------------------------------------
     def add_hotkey_editor(self, parent, label, var, key_name):
-        frame = tb.Frame(parent, padding=10)
-        frame.pack(fill=X, pady=5)
-        tb.Label(frame, text=label, font=("Segoe UI", 12, "bold")).pack(anchor=W)
-        tb.Label(frame, textvariable=var, font=("Segoe UI", 10)).pack(anchor=W)
-        tb.Button(
-            frame, text="Change", bootstyle="secondary",
+        card = RoundCard(parent, radius=14)
+        card.pack(fill=X, pady=5)
+        frame = card.inner
+        tb.Label(frame, text=label, font=("Supreme", 12, "bold")).pack(anchor=W)
+        tb.Label(frame, textvariable=var, font=("Supreme", 10)).pack(anchor=W)
+        PillButton(
+            frame, text="Change", bootstyle="secondary", height=30,
             command=lambda: self.open_hotkey_popup(var, key_name),
         ).pack(anchor=E, pady=5)
 
@@ -1198,11 +1846,13 @@ class UI:
         popup.geometry("320x220")
         popup.grab_set()
 
-        tb.Label(popup, text="Hold your new hotkey...", font=("Segoe UI", 12)).pack(pady=(10, 2))
-        preview = tb.Label(popup, text="", font=("Segoe UI", 11, "bold"))
+        card = RoundCard(popup, radius=16)
+        card.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        tb.Label(card.inner, text="Hold your new hotkey...", font=("Supreme", 12)).pack(pady=(10, 2))
+        preview = tb.Label(card.inner, text="", font=("Supreme", 11, "bold"))
         preview.pack(pady=2)
-        hint = tb.Label(popup, text="Release the keys, then press Confirm.",
-                        font=("Segoe UI", 8), foreground="#8b949e")
+        hint = tb.Label(card.inner, text="Release the keys, then press Confirm.",
+                        font=("Supreme", 8), foreground="#8b949e")
         hint.pack(pady=(0, 6))
 
         capture = HotkeyCapture()
@@ -1258,16 +1908,28 @@ class UI:
             self.notify("Hotkey updated.")
             cleanup()
 
-        btns = tb.Frame(popup)
+        btns = tb.Frame(card.inner)
         btns.pack(pady=8)
-        tb.Button(btns, text="Confirm hotkey", bootstyle="primary",
-                  command=confirm).pack(side=LEFT, padx=6)
-        tb.Button(btns, text="Cancel", bootstyle="secondary",
-                  command=cleanup).pack(side=LEFT, padx=6)
+        PillButton(btns, text="Confirm hotkey", bootstyle="primary",
+                   command=confirm).pack(side=LEFT, padx=6)
+        PillButton(btns, text="Cancel", bootstyle="secondary",
+                   command=cleanup).pack(side=LEFT, padx=6)
         popup.bind("<Escape>", lambda _e: cleanup())
         popup.protocol("WM_DELETE_WINDOW", cleanup)
 
         hook = keyboard.hook(on_key)
+
+    def open_releases_page(self):
+        """Open the GitHub releases page in the default browser."""
+        try:
+            import webbrowser
+            webbrowser.open(
+                "https://github.com/TheGrandSupreme/KillCamPlus/releases")
+        except Exception:
+            try:
+                self.notify("Could not open the releases page.")
+            except Exception:
+                pass
 
     # ---------------------------------------------------
     # Folder picker
@@ -1377,7 +2039,10 @@ class UI:
     # Close handler (minimize to tray; recording continues)
     # ---------------------------------------------------
     def on_close(self):
-        self.save_settings()
+        try:
+            self.save_settings()
+        except Exception:
+            pass
         if _HAVE_TRAY and self._ensure_tray():
             try:
                 self.root.withdraw()
