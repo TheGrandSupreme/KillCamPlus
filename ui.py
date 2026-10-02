@@ -245,6 +245,7 @@ class _GpuSampler:
             arr = (_Item * cnt.value).from_buffer(buf)
             want = {"pid_%d_" % int(p) for p in pids}
             total = 0.0
+            system = 0.0
             for i in range(cnt.value):
                 try:
                     if arr[i].status != 0:
@@ -252,12 +253,14 @@ class _GpuSampler:
                     nm = arr[i].name or ""
                 except (ValueError, AttributeError):
                     continue
+                try:
+                    v = float(arr[i].value)
+                except (TypeError, ValueError):
+                    continue
+                system += v
                 if any(nm.startswith(w) for w in want):
-                    try:
-                        total += float(arr[i].value)
-                    except (TypeError, ValueError):
-                        pass
-            return max(0.0, total)
+                    total += v
+            return max(0.0, total), max(0.0, system)
         except Exception:
             return None
 
@@ -313,7 +316,13 @@ def _child_exe_pids(exe_sub):
 
 
 def _process_private_mb():
-    """This process's private bytes in MB (TM Memory column equivalent)."""
+    """This process's working set in MB (what Task Manager shows).
+
+    Deliberately NOT private-committed: libraries reserve ~360 MB of
+    committed-but-untouched heap at import, which reads ~3x higher than
+    Task Manager while nothing is resident. Working set = resident, so
+    the two agree and the row stays comparable.
+    """
     try:
         import ctypes
 
@@ -343,7 +352,7 @@ def _process_private_mb():
         pmc.cb = ctypes.sizeof(pmc)
         if not psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
             return None
-        return float(pmc.pagefile) / (1024 * 1024)
+        return float(pmc.working) / (1024 * 1024)
     except Exception:
         return None
 
@@ -1069,10 +1078,15 @@ class UI:
         # samples land (no fake zero flatline).
         self.perf_history = collections.deque(maxlen=60)
         self.perf_gpu_history = collections.deque(maxlen=60)
+        self.perf_gpu_sys_history = collections.deque(maxlen=60)
         self._perf_sampler = _ThreadCpuSampler()
         self._perf_gpu = _GpuSampler()
         self._perf_ema = 0.0
         self._perf_gpu_val = 0.0
+        try:
+            self._perf_ncpu = max(1, int(os.cpu_count() or 1))
+        except (TypeError, ValueError):
+            self._perf_ncpu = 1
         try:
             self._perf_sampler.sample()  # prime baseline: first tick reads real
         except Exception:
@@ -1437,7 +1451,7 @@ class UI:
         self.perf_graph = tk.Canvas(perf_right, height=110, bg="#0d1117",
                                     highlightthickness=0)
         self.perf_graph.pack(fill=X, expand=True, pady=(0, 6))
-        tb.Label(perf_right, text="GPU % ours (measured)",
+        tb.Label(perf_right, text="GPU % ours (green) / system (grey)",
                  font=("Supreme", 9, "bold")).pack(anchor=W)
         self.perf_gpu_graph = tk.Canvas(perf_right, height=70, bg="#0d1117",
                                         highlightthickness=0)
@@ -1810,8 +1824,12 @@ class UI:
     # ---------------------------------------------------
     # Preview updater
     # ---------------------------------------------------
-    def _draw_plot(self, canvas, points, ceiling):
-        """Task-Manager-style trace: grid thirds + measured polyline."""
+    def _draw_plot(self, canvas, series, ceiling):
+        """Task-Manager-style traces: grid thirds + measured polylines.
+
+        series = [(points, color)] drawn in order. Empty histories draw
+        grid only (never synthesized).
+        """
         canvas.delete("plot")
         gw = canvas.winfo_width()
         gh = canvas.winfo_height()
@@ -1822,17 +1840,18 @@ class UI:
             canvas.create_line(0, y, gw, y, fill="#1c2128", tags="plot")
         canvas.create_line(0, gh - 8, gw, gh - 8,
                            fill="#21262d", tags="plot")
-        pts = list(points)
-        n = len(pts)
-        if n < 2:
-            return
-        ceil = max(ceiling, max(pts))
-        xs = gw / max(1, n - 1)
-        for i in range(n - 1):
-            canvas.create_line(
-                i * xs, gh - 8 - pts[i] * (gh - 16) / ceil,
-                (i + 1) * xs, gh - 8 - pts[i + 1] * (gh - 16) / ceil,
-                fill="#3fb950", width=2, tags="plot")
+        for points, color in series:
+            pts = list(points)
+            n = len(pts)
+            if n < 2:
+                continue
+            ceil = max(ceiling, max(pts))
+            xs = gw / max(1, n - 1)
+            for i in range(n - 1):
+                canvas.create_line(
+                    i * xs, gh - 8 - pts[i] * (gh - 16) / ceil,
+                    (i + 1) * xs, gh - 8 - pts[i + 1] * (gh - 16) / ceil,
+                    fill=color, width=2, tags="plot")
 
     def _update_performance(self):
         """Refresh honest telemetry: measured thread CPU + live engine stats.
@@ -1847,9 +1866,16 @@ class UI:
         if total is None:
             return  # sampler warming up; leave labels/graph as-is
         try:
-            total = max(0.0, min(100.0, float(total)))
+            total = max(0.0, float(total))
         except (TypeError, ValueError):
             return
+        try:
+            ncpu = max(1, int(getattr(self, "_perf_ncpu", 1) or 1))
+        except (TypeError, ValueError):
+            ncpu = 1
+        # Machine units (Task Manager semantics): share of total capacity,
+        # not share of one core.
+        total_m = min(100.0, total / ncpu)
         try:
             rec = self.recorder
             ring_mb = float(getattr(rec, "_frag_bytes", 0) or 0) / (1024 * 1024)
@@ -1861,8 +1887,8 @@ class UI:
                 tmode = "raw"
         except Exception:
             return
-        self._perf_ema = 0.4 * total + 0.6 * (self._perf_ema or 0.0)
-        self.perf_history.append(total)
+        self._perf_ema = 0.4 * total_m + 0.6 * (self._perf_ema or 0.0)
+        self.perf_history.append(total_m)
         try:
             ram_mb = _process_private_mb()
         except Exception:
@@ -1873,16 +1899,25 @@ class UI:
             gpu = self._perf_gpu.sample(pids)
         except Exception:
             gpu = None
-        if isinstance(gpu, float):
-            self._perf_gpu_val = gpu
-            self.perf_gpu_history.append(max(0.0, gpu))
+        gpu_ours, gpu_sys = None, None
+        if isinstance(gpu, tuple) and len(gpu) == 2:
+            gpu_ours, gpu_sys = gpu
+        if isinstance(gpu_ours, float):
+            self._perf_gpu_val = gpu_ours
+            self.perf_gpu_history.append(max(0.0, gpu_ours))
+        if isinstance(gpu_sys, float):
+            self.perf_gpu_sys_history.append(max(0.0, gpu_sys))
         try:
-            self.lbl_perf_cpu.config(text="App CPU (threads)")
+            self.lbl_perf_cpu.config(text="App CPU (% machine)")
             self.lbl_perf_cpu_big.config(text="%.1f%%" % self._perf_ema)
             if ram_mb is not None:
                 self.lbl_perf_ram.config(text="RAM: %.0f MB" % ram_mb)
-            if isinstance(gpu, float):
-                self.lbl_perf_gpu.config(text="GPU: %.1f%%" % gpu)
+            if isinstance(gpu_ours, float):
+                if isinstance(gpu_sys, float):
+                    self.lbl_perf_gpu.config(
+                        text="GPU: %.1f%% (sys %.0f%%)" % (gpu_ours, gpu_sys))
+                else:
+                    self.lbl_perf_gpu.config(text="GPU: %.1f%%" % gpu_ours)
             elif getattr(self._perf_gpu, "_q", None) is None:
                 self.lbl_perf_gpu.config(text="GPU: n/a")
             self.lbl_perf_ring.config(text="Ring buffer: %.1f MB" % ring_mb)
@@ -1891,8 +1926,12 @@ class UI:
         except (tk.TclError, AttributeError):
             pass
         try:
-            self._draw_plot(self.perf_graph, self.perf_history, 5.0)
-            self._draw_plot(self.perf_gpu_graph, self.perf_gpu_history, 20.0)
+            self._draw_plot(self.perf_graph, [(self.perf_history, "#3fb950")],
+                            5.0)
+            self._draw_plot(self.perf_gpu_graph,
+                            [(self.perf_gpu_sys_history, "#6e7681"),
+                             (self.perf_gpu_history, "#3fb950")],
+                            20.0)
         except (tk.TclError, AttributeError):
             pass
 
