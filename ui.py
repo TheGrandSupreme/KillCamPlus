@@ -3,10 +3,146 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 from tkinter import filedialog
 import keyboard
+import sys
 import time
 import os
+import collections
 import threading
 import subprocess
+
+
+_sfx_aliases = {}  # mci alias -> True (opened once, replayed with play-from-0)
+
+
+def _sfx_file(name):
+    """Resolve sounds/<name> in dev tree, frozen bundle, or exe dir."""
+    cands = []
+    try:
+        cands.append(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "sounds", name))
+    except (TypeError, OSError):
+        pass
+    try:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(os.path.join(meipass, "sounds", name))
+        cands.append(os.path.join(
+            os.path.dirname(sys.executable), "sounds", name))
+    except (TypeError, OSError, AttributeError):
+        pass
+    for cand in cands:
+        try:
+            if cand and os.path.isfile(cand):
+                return cand
+        except (TypeError, OSError):
+            continue
+    return None
+
+
+def _play_sfx(name):
+    """Fire-and-forget toast sound (MCI, async: never blocks the UI).
+
+    Garnish only: every failure path is silent so a missing file or
+    headless session can never break a toast. Returns the MCI play
+    code (0 = playing) for diagnostics.
+    """
+    try:
+        import ctypes
+        winmm = ctypes.windll.winmm
+        try:
+            winmm.mciSendStringW.restype = ctypes.c_ulong
+            winmm.mciSendStringW.argtypes = [
+                ctypes.c_wchar_p, ctypes.c_wchar_p,
+                ctypes.c_uint, ctypes.c_void_p]
+        except Exception:
+            pass
+        path = _sfx_file(name)
+        if not path:
+            return 275
+        alias = "killcam_%s" % "".join(
+            c if c.isalnum() else "_" for c in name)
+        if alias not in _sfx_aliases:
+            if winmm.mciSendStringW(
+                    'open "%s" alias %s' % (path, alias),
+                    None, 0, None) != 0:
+                return 274
+            _sfx_aliases[alias] = True
+        return int(winmm.mciSendStringW(
+            "play %s from 0" % alias, None, 0, None))
+    except Exception:
+        return 273
+
+
+class _ThreadCpuSampler:
+    """Win32 GetThreadTimes sampler: true per-thread CPU, sleeps excluded.
+
+    sample() returns (total_pct, [(pct, name)]) as % of one core over
+    the interval since the previous call, or (None, []) while warming.
+    """
+
+    def __init__(self):
+        self._prev = {}
+        self._last_wall = 0.0
+
+    def sample(self):
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+        except Exception:
+            return None, []
+        try:
+            import threading as _th
+            import time as _t
+
+            class _FT(ctypes.Structure):
+                _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+
+            warmed = bool(self._prev)
+            now = _t.monotonic()
+            dt = max(1e-3, now - self._last_wall) if self._last_wall else 0.0
+            cur, total, rows = {}, 0.0, []
+            for t in _th.enumerate():
+                try:
+                    tid = t.ident
+                    if not tid:
+                        continue
+                    h = k32.OpenThread(0x0040, False, tid)
+                    if not h:
+                        continue
+                    try:
+                        c, x, kk, u = _FT(), _FT(), _FT(), _FT()
+                        if not k32.GetThreadTimes(
+                                h, ctypes.byref(c), ctypes.byref(x),
+                                ctypes.byref(kk), ctypes.byref(u)):
+                            continue
+                        ticks = (((kk.high << 32) | kk.low)
+                                 + ((u.high << 32) | u.low))
+                    finally:
+                        try:
+                            k32.CloseHandle(h)
+                        except Exception:
+                            pass
+                    cur[tid] = ticks
+                    p = self._prev.get(tid)
+                    if warmed and p is not None and ticks >= p and dt > 0:
+                        pct = (ticks - p) / 1e7 / dt * 100.0
+                        total += pct
+                        try:
+                            tgt = getattr(t, "_target", None)
+                            fn = (getattr(tgt, "__qualname__", None)
+                                  or getattr(tgt, "__name__", None) or t.name)
+                        except Exception:
+                            fn = t.name
+                        rows.append((pct, str(fn)))
+                except Exception:
+                    continue
+            self._prev = cur
+            self._last_wall = now
+            if not warmed:
+                return None, []
+            return max(0.0, total), sorted(rows, reverse=True)
+        except Exception:
+            return None, []
 
 from autostart import enable_autostart, disable_autostart, is_autostart_enabled
 
@@ -19,6 +155,197 @@ try:
     import appicons as _appicons
 except (ImportError, OSError):
     _appicons = None
+
+
+class _GpuSampler:
+    """Per-process GPU utilization via PDH GPU-Engine counters.
+
+    Same source Task Manager graphs: sums Utilization Percentage over
+    instances owned by the given PIDs (all engines: 3D, VideoEncode,
+    Copy...). sample() collects at most ~1 Hz internally and returns
+    the last-1s average, or None while priming/unavailable.
+    """
+
+    def __init__(self):
+        self._q = None
+        self._ctr = None
+        self._collects = 0
+        self._tick = 0
+        try:
+            import ctypes
+            pdh = ctypes.windll.pdh
+            q = ctypes.c_void_p()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0:
+                return
+            ctr = ctypes.c_void_p()
+            if pdh.PdhAddEnglishCounterW(
+                    q, "\\GPU Engine(*)\\Utilization Percentage",
+                    0, ctypes.byref(ctr)) != 0:
+                try:
+                    pdh.PdhCloseQuery(q)
+                except Exception:
+                    pass
+                return
+            pdh.PdhCollectQueryData(q)
+            self._q, self._ctr = q, ctr
+            self._collects = 1
+        except Exception:
+            self._q = None
+
+    def sample(self, pids):
+        try:
+            import ctypes
+            pdh = ctypes.windll.pdh
+            try:
+                pdh.PdhOpenQueryW.restype = ctypes.c_long
+                pdh.PdhAddEnglishCounterW.restype = ctypes.c_long
+                pdh.PdhCollectQueryData.restype = ctypes.c_long
+                pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_long
+                pdh.PdhCloseQuery.restype = ctypes.c_long
+            except Exception:
+                pass
+        except Exception:
+            return None
+        if self._q is None:
+            return None
+        try:
+            self._tick += 1
+            if self._tick % 5 != 0:
+                return "hold"
+            if pdh.PdhCollectQueryData(self._q) != 0:
+                return None
+            self._collects += 1
+            if self._collects < 2:
+                return None  # needs two collects for a rate
+
+            class _Item(ctypes.Structure):
+                # PDH_FMT_COUNTERVALUE_ITEM_W: LPWSTR + DWORD status +
+                # 8-byte union (double here). The status DWORD pads the
+                # struct to 24 bytes; a 16-byte guess walks off into
+                # garbage pointers (native crash, verified once).
+                _fields_ = [("name", ctypes.c_wchar_p),
+                            ("status", ctypes.c_ulong),
+                            ("value", ctypes.c_double)]
+
+            # Two-call pattern: size query first (names ride after the
+            # array in the same buffer, so a fixed struct array is
+            # always too small).
+            bufsz = ctypes.c_ulong(0)
+            cnt = ctypes.c_ulong(0)
+            pdh.PdhGetFormattedCounterArrayW(
+                self._ctr, 0x200, ctypes.byref(bufsz),
+                ctypes.byref(cnt), None)
+            if not bufsz.value or cnt.value <= 0 or cnt.value > 4096:
+                return None
+            buf = (ctypes.c_ubyte * bufsz.value)()
+            if pdh.PdhGetFormattedCounterArrayW(
+                    self._ctr, 0x200, ctypes.byref(bufsz),
+                    ctypes.byref(cnt), buf) != 0:
+                return None
+            arr = (_Item * cnt.value).from_buffer(buf)
+            want = {"pid_%d_" % int(p) for p in pids}
+            total = 0.0
+            for i in range(cnt.value):
+                try:
+                    if arr[i].status != 0:
+                        continue
+                    nm = arr[i].name or ""
+                except (ValueError, AttributeError):
+                    continue
+                if any(nm.startswith(w) for w in want):
+                    try:
+                        total += float(arr[i].value)
+                    except (TypeError, ValueError):
+                        pass
+            return max(0.0, total)
+        except Exception:
+            return None
+
+
+def _child_exe_pids(exe_sub):
+    """PIDs of our direct children whose exe name contains exe_sub."""
+    try:
+        import ctypes
+        import os as _os
+
+        class _PE(ctypes.Structure):
+            # th32DefaultHeapID is ULONG_PTR (8 bytes on x64).
+            _fields_ = [("size", ctypes.c_ulong),
+                        ("usage", ctypes.c_ulong),
+                        ("pid", ctypes.c_ulong),
+                        ("heap", ctypes.c_size_t),
+                        ("mod", ctypes.c_ulong),
+                        ("threads", ctypes.c_ulong),
+                        ("ppid", ctypes.c_ulong),
+                        ("pri", ctypes.c_long),
+                        ("flags", ctypes.c_ulong),
+                        ("exe", ctypes.c_wchar * 260)]
+
+        k32 = ctypes.windll.kernel32
+        try:
+            k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        except Exception:
+            pass
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+        if snap is None or int(snap) < 0:
+            return []
+        out = []
+        try:
+            pe = _PE()
+            pe.size = ctypes.sizeof(pe)
+            ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+            while ok:
+                try:
+                    if (int(pe.ppid) == int(_os.getpid())
+                            and exe_sub in str(pe.exe).lower()):
+                        out.append(int(pe.pid))
+                except (TypeError, ValueError):
+                    pass
+                ok = k32.Process32NextW(snap, ctypes.byref(pe))
+        finally:
+            try:
+                k32.CloseHandle(snap)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+
+def _process_private_mb():
+    """This process's private bytes in MB (TM Memory column equivalent)."""
+    try:
+        import ctypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong),
+                        ("page_faults", ctypes.c_ulong),
+                        ("peak_working", ctypes.c_size_t),
+                        ("working", ctypes.c_size_t),
+                        ("quota_peak_paged", ctypes.c_size_t),
+                        ("quota_paged", ctypes.c_size_t),
+                        ("quota_peak_nonpaged", ctypes.c_size_t),
+                        ("quota_nonpaged", ctypes.c_size_t),
+                        ("pagefile", ctypes.c_size_t),
+                        ("peak_pagefile", ctypes.c_size_t)]
+
+        k32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        try:
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            psapi.GetProcessMemoryInfo.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        except Exception:
+            pass
+        h = k32.GetCurrentProcess()
+        pmc = _PMC()
+        pmc.cb = ctypes.sizeof(pmc)
+        if not psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+            return None
+        return float(pmc.pagefile) / (1024 * 1024)
+    except Exception:
+        return None
 
 
 class _RowTip:
@@ -725,12 +1052,40 @@ class UI:
         self.fps_var = tk.StringVar(value=str(self.settings["fps"]))
         self.audio_mode_var = tk.StringVar(value=str(self.settings["audio_mode"]).lower())
         self.compression_var = tk.StringVar(value=str(self.settings.get("compression", "Medium")))
+        self.encoder_var = tk.StringVar(
+            value="GPU accelerated" if self.settings.get("use_gpu", True) else "CPU only")
+        self.transport_var = tk.StringVar(
+            value="Low resource" if str(
+                self.settings.get("transport_mode", "raw")).lower() == "compressed"
+            else "Full quality")
         self.save_folder_var = tk.StringVar(value=self.settings.get("save_folder", ""))
         self.mic_device_var = tk.StringVar(value=self.settings.get("mic_audio_device", ""))
         self.system_device_var = tk.StringVar(value=self.settings.get("system_audio_device", ""))
         self.mic_volume_var = tk.IntVar(value=self.settings.get("mic_volume", 100))
         self.system_volume_var = tk.IntVar(value=self.settings.get("system_volume", 100))
         self.monitor_var = tk.StringVar()
+        # Honest telemetry state (measured values only, never modeled).
+        # Histories start EMPTY: the graph draws nothing until real
+        # samples land (no fake zero flatline).
+        self.perf_history = collections.deque(maxlen=60)
+        self.perf_gpu_history = collections.deque(maxlen=60)
+        self._perf_sampler = _ThreadCpuSampler()
+        self._perf_gpu = _GpuSampler()
+        self._perf_ema = 0.0
+        self._perf_gpu_val = 0.0
+        try:
+            self._perf_sampler.sample()  # prime baseline: first tick reads real
+        except Exception:
+            pass
+        try:
+            _cs = str(self.settings.get("capture_source", "monitor")).lower()
+        except (AttributeError, TypeError):
+            _cs = "monitor"
+        self.capture_var = tk.StringVar(
+            value="Pinned window" if _cs == "pinned"
+            else ("Active window" if _cs == "active" else "Monitor"))
+        self.pin_window_var = tk.StringVar(
+            value=str(self.settings.get("capture_window", "") or ""))
         self.monitor_indices = [0]
 
         # Per-app mixer (session enumeration via pycaw; clip-only gains,
@@ -756,6 +1111,7 @@ class UI:
         self.hk_save = tk.StringVar(value=self.settings["hotkeys"]["save_clip"])
         self.hk_mic = tk.StringVar(value=self.settings["hotkeys"]["toggle_mic"])
         self.hk_sys = tk.StringVar(value=self.settings["hotkeys"]["toggle_system_audio"])
+        self.hk_rec = tk.StringVar(value=self.settings["hotkeys"]["toggle_recording"])
 
         # Autostart
         self.autostart_var = tk.BooleanVar(
@@ -793,6 +1149,10 @@ class UI:
         self.settings["audio_mode"] = self.audio_mode_var.get()
         comp = str(self.compression_var.get()).strip().capitalize()
         self.settings["compression"] = comp if comp in ("High", "Medium", "Low") else "Medium"
+        self.settings["use_gpu"] = str(self.encoder_var.get()).strip().lower() != "cpu only"
+        self.settings["transport_mode"] = (
+            "compressed" if "low resource" in str(self.transport_var.get()).lower()
+            else "raw")
         self.settings["save_folder"] = self.save_folder_var.get()
         mic_device = self.mic_device_var.get().strip()
         system_device = self.system_device_var.get().strip()
@@ -811,6 +1171,15 @@ class UI:
         monitor_changed = (mon_idx != self.recorder.monitor_index)
         self.settings["monitor_index"] = mon_idx
         self.recorder.monitor_index = mon_idx
+        want_source = str(self.capture_var.get()).strip().lower()
+        if want_source.startswith("pin"):
+            self.settings["capture_source"] = "pinned"
+        elif want_source.startswith("active"):
+            self.settings["capture_source"] = "active"
+        else:
+            self.settings["capture_source"] = "monitor"
+        self.settings["capture_window"] = self._pin_exe_for_display(
+            str(self.pin_window_var.get() or ""))
         if self.app_mixer is not None:
             self.settings["app_volumes"] = dict(self.app_mixer.saved)
         if device_changed and self.recorder.recording:
@@ -824,6 +1193,7 @@ class UI:
         self.settings["hotkeys"]["save_clip"] = self.hk_save.get()
         self.settings["hotkeys"]["toggle_mic"] = self.hk_mic.get()
         self.settings["hotkeys"]["toggle_system_audio"] = self.hk_sys.get()
+        self.settings["hotkeys"]["toggle_recording"] = self.hk_rec.get()
 
         self.settings["start_with_windows"] = bool(self.autostart_var.get())
 
@@ -880,7 +1250,12 @@ class UI:
     # ---------------------------------------------------
     # Notification popup
     # ---------------------------------------------------
-    def notify(self, message, duration=2000):
+    def notify(self, message, duration=2000, sfx=None):
+        try:
+            if sfx:
+                _play_sfx(sfx)
+        except Exception:
+            pass
         toast = tk.Toplevel(self.root)
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
@@ -1003,11 +1378,13 @@ class UI:
 
         recording_tab = tb.Frame(notebook, padding=10)
         settings_tab = tb.Frame(notebook, padding=10)
+        performance_tab = tb.Frame(notebook, padding=10)
         hotkeys_tab = tb.Frame(notebook, padding=10)
         about_tab = tb.Frame(notebook, padding=10)
 
         notebook.add(recording_tab, text="Recording")
         notebook.add(settings_tab, text="Settings")
+        notebook.add(performance_tab, text="Performance")
         notebook.add(hotkeys_tab, text="Hotkeys")
         notebook.add(about_tab, text="About")
 
@@ -1017,10 +1394,67 @@ class UI:
         rec_card.pack(fill=BOTH, expand=True)
         set_card = RoundCard(settings_tab, radius=18)
         set_card.pack(fill=BOTH, expand=True)
+        perf_card = RoundCard(performance_tab, radius=18)
+        perf_card.pack(fill=BOTH, expand=True)
         hk_card = RoundCard(hotkeys_tab, radius=18)
         hk_card.pack(fill=BOTH, expand=True)
         abt_card = RoundCard(about_tab, radius=18)
         abt_card.pack(fill=BOTH, expand=True)
+        self.performance_tab = performance_tab
+
+        # ---- Performance Tab (measured values only, never modeled) ----
+        tb.Label(perf_card.inner, text="Performance",
+                 font=("Supreme", 14, "bold")).pack(anchor=CENTER, pady=(0, 6))
+        perf_top = tb.Frame(perf_card.inner)
+        perf_top.pack(fill=BOTH, expand=True, pady=(0, 6))
+        perf_left = tb.Frame(perf_top)
+        perf_left.pack(side=LEFT, fill=Y, padx=(0, 12))
+        self.lbl_perf_cpu = tb.Label(perf_left, text="App CPU",
+                                     font=("Supreme", 10, "bold"))
+        self.lbl_perf_cpu.pack(anchor=W, pady=(0, 0))
+        self.lbl_perf_cpu_big = tb.Label(perf_left, text="--",
+                                         font=("Supreme", 22, "bold"))
+        self.lbl_perf_cpu_big.pack(anchor=W, pady=(0, 6))
+        self.lbl_perf_ram = tb.Label(perf_left, text="RAM: --",
+                                     font=("Supreme", 10, "bold"))
+        self.lbl_perf_ram.pack(anchor=W, pady=2)
+        self.lbl_perf_gpu = tb.Label(perf_left, text="GPU: --",
+                                     font=("Supreme", 10, "bold"))
+        self.lbl_perf_gpu.pack(anchor=W, pady=2)
+        self.lbl_perf_ring = tb.Label(perf_left, text="Ring buffer: --",
+                                      font=("Supreme", 10))
+        self.lbl_perf_ring.pack(anchor=W, pady=2)
+        self.lbl_perf_fps = tb.Label(perf_left, text="Capture: --",
+                                     font=("Supreme", 10))
+        self.lbl_perf_fps.pack(anchor=W, pady=2)
+        self.lbl_perf_enc = tb.Label(perf_left, text="Encoder: --",
+                                     font=("Supreme", 10))
+        self.lbl_perf_enc.pack(anchor=W, pady=2)
+        perf_right = tb.Frame(perf_top)
+        perf_right.pack(side=LEFT, fill=BOTH, expand=True)
+        tb.Label(perf_right, text="App CPU % (measured)",
+                 font=("Supreme", 9, "bold")).pack(anchor=W)
+        self.perf_graph = tk.Canvas(perf_right, height=110, bg="#0d1117",
+                                    highlightthickness=0)
+        self.perf_graph.pack(fill=X, expand=True, pady=(0, 6))
+        tb.Label(perf_right, text="GPU % ours (measured)",
+                 font=("Supreme", 9, "bold")).pack(anchor=W)
+        self.perf_gpu_graph = tk.Canvas(perf_right, height=70, bg="#0d1117",
+                                        highlightthickness=0)
+        self.perf_gpu_graph.pack(fill=X, expand=True, pady=(0, 2))
+        tb.Separator(perf_card.inner, bootstyle="secondary").pack(fill=X, pady=8)
+        tb.Label(
+            perf_card.inner,
+            text="Technical note: this tab samples real thread CPU via Win32 "
+                 "GetThreadTimes (sleeps excluded, so idle reads near zero). "
+                 "Task Manager's higher process number is mostly CPU time spent "
+                 "moving full-size frame bytes through the local pipe and "
+                 "converting pixels inside the bundled encoder; it scales with "
+                 "fps and resolution. The Low Resource transport below shrinks "
+                 "that traffic ~20x at some Python encode cost.",
+            font=("Supreme", 8), foreground="#8b949e",
+            wraplength=380, justify=LEFT,
+        ).pack(anchor=W, fill=X)
 
         # ---- Recording Tab ----
         tb.Label(rec_card.inner, text="Replay Buffer (seconds):").pack(anchor=W)
@@ -1035,12 +1469,20 @@ class UI:
                                  title="Preview")
         preview_card.pack(fill=BOTH, expand=True, pady=(0, 5))
 
+        # Recording target readout (outside the canvas, always visible).
+        self.cap_status_var = tk.StringVar(value="")
+        tb.Label(preview_card.inner, textvariable=self.cap_status_var,
+                 font=("Supreme", 8), foreground="#8b949e").pack(anchor=W,
+                 pady=(0, 4))
+
         self.preview_canvas = tk.Canvas(preview_card.inner, bg="#0d1117", highlightthickness=0)
         self.preview_canvas.pack(fill=BOTH, expand=True)
 
         # Smoothed audio levels (EMA)
         self._smooth_mic = 0.0
         self._smooth_sys = 0.0
+        self._preview_thumb_bytes = None
+        self._preview_photo = None
 
         # ---- Settings Tab ----
         # Scrollable container for settings
@@ -1137,6 +1579,38 @@ class UI:
             state="readonly", width=14,
         ).pack(side=LEFT, padx=(8, 0))
 
+        cap_frame = tb.Frame(settings_inner)
+        cap_frame.pack(fill=X, pady=(0, 4))
+        tb.Label(cap_frame, text="Capture:").pack(side=LEFT)
+        self.capture_box = tb.Combobox(
+            cap_frame, textvariable=self.capture_var,
+            values=["Monitor", "Active window", "Pinned window"],
+            state="readonly", width=13,
+        )
+        self.capture_box.pack(side=LEFT, padx=(8, 0))
+        self.capture_box.bind("<<ComboboxSelected>>",
+                              lambda _e: self.on_capture_selected())
+        tb.Label(
+            settings_inner,
+            text="Active window follows focus (smaller area = less encode work).\n"
+                 "Pinned records one app wherever it is. Either way the window\n"
+                 "must stay visible; covering it records the cover.",
+            font=("Supreme", 8), foreground="#8b949e",
+            wraplength=360, justify=LEFT,
+        ).pack(anchor=W, pady=(0, 4))
+        pin_frame = tb.Frame(settings_inner)
+        pin_frame.pack(fill=X, pady=(0, 4))
+        tb.Label(pin_frame, text="Pinned app:").pack(side=LEFT)
+        self.pin_window_box = tb.Combobox(
+            pin_frame, textvariable=self.pin_window_var,
+            values=self._window_choices(), state="readonly", width=26,
+            postcommand=self._refresh_window_choices,
+        )
+        self.pin_window_box.pack(side=LEFT, padx=(8, 0))
+        self.pin_window_box.bind("<<ComboboxSelected>>",
+                                 lambda _e: self.on_pin_selected())
+        self._pin_frame = pin_frame
+
         mon_frame = tb.Frame(settings_inner)
         mon_frame.pack(fill=X, pady=(0, 4))
         tb.Label(mon_frame, text="Monitor:").pack(side=LEFT)
@@ -1147,6 +1621,7 @@ class UI:
         )
         self.monitor_box.pack(side=LEFT, padx=(8, 0))
         self.monitor_box.bind("<<ComboboxSelected>>", lambda _e: self.on_monitor_selected())
+        self._sync_monitor_box_state()
 
         comp_frame = tb.Frame(settings_inner)
         comp_frame.pack(fill=X, pady=(0, 2))
@@ -1162,6 +1637,39 @@ class UI:
                  "Medium: Medium performance/Medium quality loss (Mid-range machines)\n"
                  "Low: Worse Performance/Almost 0 quality loss (High-end machines)\n"
                  "Applies on restart.",
+            font=("Supreme", 8), foreground="#8b949e",
+            wraplength=360, justify=LEFT,
+        ).pack(anchor=W, pady=(0, 4))
+
+        enc_frame = tb.Frame(settings_inner)
+        enc_frame.pack(fill=X, pady=(0, 2))
+        tb.Label(enc_frame, text="Encoder:").pack(side=LEFT)
+        tb.Combobox(
+            enc_frame, textvariable=self.encoder_var,
+            values=["GPU accelerated", "CPU only"],
+            state="readonly", width=16,
+        ).pack(side=LEFT, padx=(8, 0))
+        tb.Label(
+            settings_inner,
+            text="GPU uses the graphics card (NVENC); CPU only keeps the\n"
+                 "same High/Medium/Low quality with x264. Applies on restart.",
+            font=("Supreme", 8), foreground="#8b949e",
+            wraplength=360, justify=LEFT,
+        ).pack(anchor=W, pady=(0, 4))
+
+        tp_frame = tb.Frame(settings_inner)
+        tp_frame.pack(fill=X, pady=(0, 2))
+        tb.Label(tp_frame, text="Transport:").pack(side=LEFT)
+        tb.Combobox(
+            tp_frame, textvariable=self.transport_var,
+            values=["Full quality", "Low resource"],
+            state="readonly", width=14,
+        ).pack(side=LEFT, padx=(8, 0))
+        tb.Label(
+            settings_inner,
+            text="Full quality streams raw pixels (best clips, more data).\n"
+                 "Low resource pre-encodes JPEG (~20x less traffic, softer clips).\n"
+                 "Applies on next recording start.",
             font=("Supreme", 8), foreground="#8b949e",
             wraplength=360, justify=LEFT,
         ).pack(anchor=W, pady=(0, 4))
@@ -1217,13 +1725,14 @@ class UI:
         self.add_hotkey_editor(hk_card.inner, "Save Clip", self.hk_save, "save_clip")
         self.add_hotkey_editor(hk_card.inner, "Toggle Mic", self.hk_mic, "toggle_mic")
         self.add_hotkey_editor(hk_card.inner, "Toggle System Audio", self.hk_sys, "toggle_system_audio")
+        self.add_hotkey_editor(hk_card.inner, "Start/Stop Session Recording", self.hk_rec, "toggle_recording")
 
         # ---- About Tab ----
         tb.Label(abt_card.inner, text="KillCam+", font=("Supreme", 18, "bold")).pack(pady=10)
-        tb.Label(abt_card.inner, text="2.1.0", font=("Supreme", 10)).pack(pady=(0, 6))
+        tb.Label(abt_card.inner, text="3.1.0", font=("Supreme", 10)).pack(pady=(0, 6))
         tb.Label(
             abt_card.inner,
-            text="Light-weight clipping software\nMade by TGS",
+            text="Light-weight recording software\nMade by TGS",
             justify=CENTER,
         ).pack()
         PillButton(abt_card.inner, text="All versions", bootstyle="primary",
@@ -1235,13 +1744,19 @@ class UI:
         controls = tb.Frame(main_frame)
         controls.pack(fill=X, pady=(10, 0))
         PillButton(controls, text="Save clip", bootstyle="primary", command=self.save_clip).pack(side=LEFT, padx=8)
+        self.session_btn = PillButton(controls, text="Start Record", bootstyle="secondary",
+                                      command=self.toggle_session_record)
+        self.session_btn.pack(side=LEFT, padx=8)
+        self.session_timer = tb.Label(controls, text="", font=("Supreme", 10, "bold"),
+                                     foreground="#ff4d4f")
+        self.session_timer.pack(side=LEFT, padx=8)
         self.stream_status = tb.Label(controls, text="", font=("Supreme", 8), foreground="#8b949e")
         self.stream_status.pack(side=LEFT, padx=8)
 
         # ---- Wiring ----
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         for selector in (self.buffer_var, self.resolution_var, self.fps_var, self.audio_mode_var,
-                         self.compression_var):
+                         self.compression_var, self.encoder_var, self.transport_var):
             selector.trace_add("write", lambda *_: self.save_settings())
         for selector in (self.mic_device_box, self.system_device_box, self.folder_box):
             selector.bind("<<ComboboxSelected>>", lambda _event: self.save_settings())
@@ -1295,10 +1810,138 @@ class UI:
     # ---------------------------------------------------
     # Preview updater
     # ---------------------------------------------------
+    def _draw_plot(self, canvas, points, ceiling):
+        """Task-Manager-style trace: grid thirds + measured polyline."""
+        canvas.delete("plot")
+        gw = canvas.winfo_width()
+        gh = canvas.winfo_height()
+        if gw < 10 or gh < 10:
+            return
+        for frac in (0.25, 0.5, 0.75):
+            y = gh - 8 - (gh - 16) * frac
+            canvas.create_line(0, y, gw, y, fill="#1c2128", tags="plot")
+        canvas.create_line(0, gh - 8, gw, gh - 8,
+                           fill="#21262d", tags="plot")
+        pts = list(points)
+        n = len(pts)
+        if n < 2:
+            return
+        ceil = max(ceiling, max(pts))
+        xs = gw / max(1, n - 1)
+        for i in range(n - 1):
+            canvas.create_line(
+                i * xs, gh - 8 - pts[i] * (gh - 16) / ceil,
+                (i + 1) * xs, gh - 8 - pts[i + 1] * (gh - 16) / ceil,
+                fill="#3fb950", width=2, tags="plot")
+
+    def _update_performance(self):
+        """Refresh honest telemetry: measured thread CPU + live engine stats.
+
+        History holds measured samples only (flat when idle by nature,
+        never synthesized). Guarded so a hidden tab costs nothing.
+        """
+        try:
+            total, _rows = self._perf_sampler.sample()
+        except Exception:
+            return
+        if total is None:
+            return  # sampler warming up; leave labels/graph as-is
+        try:
+            total = max(0.0, min(100.0, float(total)))
+        except (TypeError, ValueError):
+            return
+        try:
+            rec = self.recorder
+            ring_mb = float(getattr(rec, "_frag_bytes", 0) or 0) / (1024 * 1024)
+            cap_fps = getattr(rec, "cap_fps", "?")
+            enc = getattr(rec, "_live_encoder", None) or "?"
+            try:
+                tmode = rec._transport_mode()
+            except (AttributeError, TypeError):
+                tmode = "raw"
+        except Exception:
+            return
+        self._perf_ema = 0.4 * total + 0.6 * (self._perf_ema or 0.0)
+        self.perf_history.append(total)
+        try:
+            ram_mb = _process_private_mb()
+        except Exception:
+            ram_mb = None
+        try:
+            import os as _os
+            pids = [_os.getpid()] + _child_exe_pids("ffmpeg")
+            gpu = self._perf_gpu.sample(pids)
+        except Exception:
+            gpu = None
+        if isinstance(gpu, float):
+            self._perf_gpu_val = gpu
+            self.perf_gpu_history.append(max(0.0, gpu))
+        try:
+            self.lbl_perf_cpu.config(text="App CPU (threads)")
+            self.lbl_perf_cpu_big.config(text="%.1f%%" % self._perf_ema)
+            if ram_mb is not None:
+                self.lbl_perf_ram.config(text="RAM: %.0f MB" % ram_mb)
+            if isinstance(gpu, float):
+                self.lbl_perf_gpu.config(text="GPU: %.1f%%" % gpu)
+            elif getattr(self._perf_gpu, "_q", None) is None:
+                self.lbl_perf_gpu.config(text="GPU: n/a")
+            self.lbl_perf_ring.config(text="Ring buffer: %.1f MB" % ring_mb)
+            self.lbl_perf_fps.config(text="Capture: %s fps" % cap_fps)
+            self.lbl_perf_enc.config(text="Encoder: %s (%s)" % (enc, tmode))
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self._draw_plot(self.perf_graph, self.perf_history, 5.0)
+            self._draw_plot(self.perf_gpu_graph, self.perf_gpu_history, 20.0)
+        except (tk.TclError, AttributeError):
+            pass
+
     def update_preview(self):
         """Update the preview canvas with live video and smoothed audio levels."""
         try:
             canvas = self.preview_canvas
+            # Pure waste when the Recording tab is hidden: skip every
+            # canvas op, but keep the (always visible) status line fresh.
+            try:
+                hidden = not canvas.winfo_viewable()
+            except tk.TclError:
+                hidden = True
+            # Same when another app has focus (in-game: nobody watches)
+            # -- EXCEPT window-following modes, where the preview is the
+            # monitor for what's being recorded. OS-level truth: the
+            # foreground window belongs to our PID or not. Fail-safe true.
+            try:
+                import ctypes
+                _fg = ctypes.windll.user32.GetForegroundWindow()
+                _pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(
+                    _fg, ctypes.byref(_pid))
+                owned = (_fg != 0 and _pid.value == os.getpid())
+            except Exception:
+                owned = True
+            try:
+                follows_window = str(self.recorder.settings.get(
+                    "capture_source", "monitor")).lower() in (
+                        "window", "active", "pinned")
+            except (AttributeError, TypeError):
+                follows_window = False
+            active = owned or follows_window
+            try:
+                self.recorder.preview_enabled = bool(active)
+            except (AttributeError, TypeError):
+                pass
+            if hidden or not active:
+                self._update_stream_status()
+                # Telemetry has its own visibility gate: the perf tab can
+                # be the viewed one exactly when the preview canvas above
+                # is hidden. Still respect focus (gaming = nobody watches).
+                try:
+                    if active and self.performance_tab.winfo_viewable():
+                        self._update_performance()
+                except (tk.TclError, AttributeError):
+                    pass
+                self.root.after(200, self.update_preview)
+                return
             canvas.delete("all")
             w = canvas.winfo_width()
             h = canvas.winfo_height()
@@ -1311,26 +1954,42 @@ class UI:
             if is_recording:
                 canvas.configure(bg="#0d1117")
 
+                # Capture source readout lives outside the canvas now.
+                try:
+                    _cap = str(self.recorder._cap_label or "")
+                except (AttributeError, TypeError, ValueError):
+                    _cap = ""
+                try:
+                    self.cap_status_var.set(("REC  " + _cap) if _cap else "")
+                except (tk.TclError, AttributeError):
+                    pass
+
+                # --- Video preview ---
                 # --- Video preview ---
                 thumb_bytes = None
                 with self.recorder.preview_lock:
                     thumb_bytes = self.recorder.preview_jpeg
 
-                if thumb_bytes:
-                    import io
-                    from PIL import Image, ImageTk
-                    img = Image.open(io.BytesIO(thumb_bytes))
-                    # Scale to fit canvas while keeping aspect ratio
-                    iw, ih = img.size
-                    scale = min(w / iw, h * 0.75 / ih)  # leave room for audio bars
-                    new_w = max(1, int(iw * scale))
-                    new_h = max(1, int(ih * scale))
-                    img = img.resize((new_w, new_h), Image.LANCZOS)
-                    self._preview_photo = ImageTk.PhotoImage(img)
-                    canvas.create_image(w // 2, int(h * 0.38), image=self._preview_photo, anchor=CENTER)
-                else:
+                if thumb_bytes is None:
                     canvas.create_text(w // 2, int(h * 0.35), text="Starting...",
                                        fill="#484f58", font=("Supreme", 11))
+                else:
+                    if thumb_bytes != self._preview_thumb_bytes:
+                        self._preview_thumb_bytes = thumb_bytes
+                        import io
+                        from PIL import Image, ImageTk
+                        img = Image.open(io.BytesIO(thumb_bytes))
+                        # Scale to fit canvas while keeping aspect ratio
+                        iw, ih = img.size
+                        scale = min(w / iw, h * 0.75 / ih)  # leave room for audio bars
+                        new_w = max(1, int(iw * scale))
+                        new_h = max(1, int(ih * scale))
+                        # BILINEAR: ~2x cheaper than LANCZOS here, visually
+                        # identical at preview size.
+                        img = img.resize((new_w, new_h), Image.BILINEAR)
+                        self._preview_photo = ImageTk.PhotoImage(img)
+                    if self._preview_photo is not None:
+                        canvas.create_image(w // 2, int(h * 0.38), image=self._preview_photo, anchor=CENTER)
 
                 # --- Smoothed audio level bars ---
                 alpha = 0.3  # EMA smoothing (lower = smoother, 0.1-0.4 good range)
@@ -1339,8 +1998,8 @@ class UI:
                 self._smooth_mic = alpha * raw_mic + (1 - alpha) * self._smooth_mic
                 self._smooth_sys = alpha * raw_sys + (1 - alpha) * self._smooth_sys
 
-                mic_pct = min(1.0, self._smooth_mic / 3000.0)
-                sys_pct = min(1.0, self._smooth_sys / 3000.0)
+                mic_pct = min(1.0, self._smooth_mic / 9000.0)
+                sys_pct = min(1.0, self._smooth_sys / 9000.0)
 
                 # Bar dimensions
                 bar_x = int(w * 0.12)
@@ -1378,8 +2037,28 @@ class UI:
             pass
 
         # Stream health: encoder, ring fill, audio dropouts, errors
+        self._update_stream_status()
+        # Honest telemetry: measured values only, hidden tab costs nothing.
+        try:
+            if self.performance_tab.winfo_viewable():
+                self._update_performance()
+        except (tk.TclError, AttributeError):
+            pass
+
+        self.root.after(200, self.update_preview)
+
+    def _update_stream_status(self):
         try:
             rec = self.recorder
+            try:
+                gen = getattr(rec, "_stream_generation", -2)
+                if (getattr(rec, "capture_frozen", False)
+                        and getattr(rec, "_frozen_notified_gen", -1) == gen
+                        and getattr(self, "_frozen_hint_gen", -3) != gen):
+                    self._frozen_hint_gen = gen
+                    self.notify("Capture looks frozen - use borderless mode.")
+            except Exception:
+                pass
             if getattr(rec, "recording", False):
                 fill = rec.frag_fill_frac() * 100.0
                 drops = getattr(rec, "audio_drops", {})
@@ -1390,20 +2069,48 @@ class UI:
                     nmic = nsys = -1
                 serr = getattr(rec, "last_stream_error", None)
                 sinfo = getattr(rec, "last_save_info", None)
-                txt = "enc=%s ring=%.0f%% ach mic=%d sys=%d drops mic=%s sys=%s" % (
+                txt = "enc=%s ring=%.0f%% ach mic=%d sys=%d drops mic=%s sys=%s cap=%s" % (
                     getattr(rec, "_live_encoder", "?"), fill, nmic, nsys,
-                    drops.get("mic", "?"), drops.get("sys", "?"))
+                    drops.get("mic", "?"), drops.get("sys", "?"),
+                    getattr(rec, "cap_fps", "?"))
                 if serr:
                     txt += " ERR: %s" % serr
                 elif sinfo:
                     txt += " (%s)" % sinfo
                 self.stream_status.configure(text=txt)
+                try:
+                    sess = " REC" if getattr(rec, "is_continuous_recording", False) else ""
+                    if sess:
+                        self.stream_status.configure(text=txt + sess)
+                except (tk.TclError, AttributeError):
+                    pass
+                self._sync_session_btn()
+                self._update_session_timer()
             else:
                 self.stream_status.configure(text="")
+                self._sync_session_btn()
+                self._update_session_timer()
         except Exception:
             pass
 
-        self.root.after(100, self.update_preview)
+    def _update_session_timer(self):
+        """Live red REC: HH:MM:SS readout while a session is active."""
+        try:
+            rec = self.recorder
+            if getattr(rec, "is_continuous_recording", False):
+                try:
+                    elapsed = max(0.0, time.monotonic() - rec._sess_wall_start)
+                except (AttributeError, TypeError):
+                    elapsed = 0.0
+                h = int(elapsed // 3600)
+                m = int((elapsed % 3600) // 60)
+                s = int(elapsed % 60)
+                self.session_timer.configure(
+                    text="REC: %02d:%02d:%02d" % (h, m, s))
+            else:
+                self.session_timer.configure(text="")
+        except (tk.TclError, AttributeError, TypeError):
+            pass
 
     # ---------------------------------------------------
     # Monitor selection
@@ -1544,6 +2251,123 @@ class UI:
                 self.recorder._restart_camera()
             except Exception as exc:
                 self.notify("Monitor switch failed: %s" % str(exc)[:120])
+
+    def on_capture_selected(self):
+        self.save_settings()
+        self._sync_monitor_box_state()
+
+    def _window_choices(self):
+        """Open windows as 'Title -- exe' display strings. Remembers the
+        saved exe even when its window is closed, so the choice persists."""
+        choices = {}
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            seen = []
+
+            CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND,
+                                    wintypes.LPARAM)
+
+            def cb(hwnd, _):
+                try:
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    if user32.IsIconic(hwnd):
+                        return True
+                    pid = ctypes.c_ulong()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    try:
+                        if int(pid.value) == os.getpid():
+                            return True
+                    except (TypeError, ValueError):
+                        pass
+                    rect = wintypes.RECT()
+                    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        return True
+                    if rect.right - rect.left < 64 or rect.bottom - rect.top < 64:
+                        return True
+                    try:
+                        n = user32.GetWindowTextLengthW(hwnd)
+                        title = ""
+                        if n > 0:
+                            buf = ctypes.create_unicode_buffer(min(n + 1, 64))
+                            user32.GetWindowTextW(hwnd, buf, min(n + 1, 64))
+                            title = (buf.value or "").strip()
+                    except (AttributeError, OSError, ValueError):
+                        title = ""
+                    if not title:
+                        return True
+                    exe = ""
+                    try:
+                        import psutil
+                        exe = str(psutil.Process(int(pid.value)).name() or "")
+                    except Exception:
+                        exe = ""
+                    if not exe:
+                        return True
+                    seen.append((title, exe))
+                except Exception:
+                    pass
+                return True
+
+            user32.EnumWindows(CB(cb), 0)
+            for title, exe in sorted(seen, key=lambda t: t[0].lower()):
+                label = "%s -- %s" % (title[:48], exe)
+                choices[label] = exe
+        except Exception:
+            pass
+        try:
+            saved = str(self.settings.get("capture_window", "") or "").strip()
+        except (AttributeError, TypeError):
+            saved = ""
+        if saved and saved not in choices.values():
+            choices["%s (saved)" % saved] = saved
+        self._pin_choices = choices
+        return list(choices)
+
+    def _refresh_window_choices(self):
+        try:
+            self.pin_window_box.configure(values=self._window_choices())
+        except tk.TclError:
+            pass
+
+    def _pin_exe_for_display(self, display):
+        try:
+            choices = getattr(self, "_pin_choices", None) or {}
+            if display in choices:
+                return choices[display]
+        except (AttributeError, TypeError):
+            pass
+        display = (display or "").strip()
+        if display.lower().endswith(".exe"):
+            return display
+        return ""
+
+    def on_pin_selected(self):
+        self.save_settings()
+
+    def _sync_monitor_box_state(self):
+        """Monitor picker only applies in monitor-capture mode; the pin
+        picker only in pinned mode."""
+        try:
+            mode = str(self.capture_var.get()).strip().lower()
+        except (tk.TclError, AttributeError, ValueError):
+            mode = "monitor"
+        pinned = mode.startswith("pin")
+        try:
+            self.monitor_box.configure(
+                state="readonly" if mode == "monitor" else "disabled")
+        except tk.TclError:
+            pass
+        try:
+            if pinned:
+                if not self._pin_frame.winfo_manager():
+                    self._pin_frame.pack(fill=X, pady=(0, 4))
+            else:
+                self._pin_frame.pack_forget()
+        except tk.TclError:
+            pass
 
     # ---------------------------------------------------
     # Per-app volume mixer UI
@@ -1932,6 +2756,7 @@ class UI:
                 "save_clip": self.hk_save.get(),
                 "toggle_mic": self.hk_mic.get(),
                 "toggle_system_audio": self.hk_sys.get(),
+                "toggle_recording": self.hk_rec.get(),
             }
             err = HotkeyCapture.validate(combo, key_name, others)
             if err is not None:
@@ -2055,6 +2880,66 @@ class UI:
             self.notify("System audio muted." if vol == 0
                         else f"System audio unmuted ({vol}%).")
 
+    def toggle_session_record(self):
+        """Start/stop long-form session recording (off-UI-thread work)."""
+        try:
+            active = bool(self.recorder.is_continuous_recording)
+        except (AttributeError, TypeError):
+            active = False
+        if active:
+            self.notify("Finalizing session…")
+            def stop():
+                try:
+                    ok = self.recorder.stop_continuous_recording()
+                except Exception:
+                    ok = False
+                try:
+                    err = self.recorder.last_save_error
+                except (AttributeError, TypeError):
+                    err = None
+                self.root.after(0, lambda: (
+                    self._sync_session_btn(),
+                    self.notify("Session saved!", sfx="recordstop.mp3") if ok
+                    else self.notify("Could not save session%s." % (
+                        " " + err if err else ""))))
+            threading.Thread(target=stop, daemon=True).start()
+            return
+        if not self.recorder.recording:
+            self.notify("Start the replay buffer before recording a session.")
+            return
+        folder = self.settings.get("save_folder") or os.getcwd()
+        path = os.path.join(
+            folder, f"session_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+        self.notify("Session recording…")
+        def start(path=path):
+            try:
+                ok = self.recorder.start_continuous_recording(path)
+            except Exception:
+                ok = False
+            try:
+                err = self.recorder.last_save_error
+            except (AttributeError, TypeError):
+                err = None
+            self.root.after(0, lambda: (
+                self._sync_session_btn(),
+                self.notify("Session recording…", sfx="recordstart.mp3") if ok
+                else self.notify("Could not start session%s." % (
+                    " " + err if err else ""))))
+        threading.Thread(target=start, daemon=True).start()
+
+    def _sync_session_btn(self):
+        """Reflect engine session state on the tray button (cheap poll)."""
+        try:
+            active = bool(self.recorder.is_continuous_recording)
+        except (AttributeError, TypeError):
+            active = False
+        try:
+            self.session_btn.configure(
+                text="Stop Record" if active else "Start Record",
+                bootstyle="danger" if active else "secondary")
+        except (tk.TclError, AttributeError, TypeError):
+            pass
+
     def save_clip(self, path=None):
         if not self.recorder.recording:
             self.notify("Start the replay buffer before saving a clip.")
@@ -2064,7 +2949,9 @@ class UI:
         self.notify("Saving clip…")
         def save():
             success = self.save_clip_callback(path)
-            self.root.after(0, lambda: self.notify("Clip saved!" if success else "Could not save the clip."))
+            self.root.after(0, lambda: self.notify(
+                "Clip saved!", sfx="clip.mp3") if success
+                else self.notify("Could not save the clip."))
         threading.Thread(target=save, daemon=True).start()
 
     def on_autostart_toggle(self):

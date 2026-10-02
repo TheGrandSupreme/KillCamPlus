@@ -7,20 +7,28 @@
     "record_microphone": true,
     "record_system_audio": true,
     "audio_mode": "mixed",
-    "compression": "High",
+    "compression": "Medium",
+    "use_gpu": true,
+    "transport_mode": "raw",
+    "use_native_core": false,
     "save_folder": "C:\\Users\\tomas\\Videos\\Captures",
     "hotkeys": {
         "save_clip": "shift+f9",
         "toggle_mic": "shift+alt+m",
-        "toggle_system_audio": "shift+alt+s"
+        "toggle_system_audio": "shift+alt+s",
+        "toggle_recording": "ctrl+shift+r"
     },
     "start_with_windows": true,
     "mic_volume": 100,
     "system_volume": 80,
     "monitor_index": 0,
+    "capture_source": "monitor",
+    "capture_window": "RocketLeague.exe",
     "app_volumes": {
-        "OpenCode.exe": 0,
-        "System Sounds": 100
+        "OpenCode.exe": 100,
+        "System Sounds": 100,
+        "chrome.exe": 0,
+        "Spotify.exe": 0
     },
     "last_mic_volume": 100,
     "last_system_volume": 80

@@ -19,7 +19,8 @@ class HotkeyManager:
 
     def reload(self):
         self.clear()
-        actions = {"save_clip": self.save_clip, "toggle_mic": self.toggle_mic, "toggle_system_audio": self.toggle_system}
+        actions = {"save_clip": self.save_clip, "toggle_mic": self.toggle_mic, "toggle_system_audio": self.toggle_system,
+                   "toggle_recording": self.toggle_recording}
         try:
             for name, action in actions.items():
                 hotkey = self.settings["hotkeys"].get(name, "")
@@ -43,3 +44,6 @@ class HotkeyManager:
     def toggle_system(self):
         vol = self.recorder.toggle_system_volume()
         self.app.root.after(0, lambda v=vol: self.app.ui.set_audio_toggle("system", v))
+
+    def toggle_recording(self):
+        self.app.root.after(0, lambda: self.app.ui.toggle_session_record())

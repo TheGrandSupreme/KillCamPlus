@@ -1,7 +1,10 @@
 import os
+import re
+import struct
 import subprocess
 import threading
 import time
+import queue
 import tempfile
 import collections
 import wave
@@ -17,9 +20,19 @@ try:
 except ImportError:
     _psutil = None
 try:
+    from screeninfo import get_monitors
+    _HAVE_SCREENINFO = True
+except (ImportError, OSError):
+    get_monitors = None
+    _HAVE_SCREENINFO = False
+try:
     import procloop as _procloop
 except (ImportError, OSError):
     _procloop = None
+try:
+    import killcam_core as _ncore  # native capture+feed (opt-in only)
+except (ImportError, OSError):
+    _ncore = None
 warnings.filterwarnings("ignore", category=p.PyAudioWPatchWarning if hasattr(p, 'PyAudioWPatchWarning') else UserWarning)
 
 # ============================================================
@@ -44,14 +57,22 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # Compression levels: GPU CQP / CPU CRF+preset / VBR maxrate / RAM cap.
 # Higher compression = smaller files = smaller ring needed for the same
-# buffer length. Snapshot at start(); applies on restart.
+# buffer length. Snapshot at start(); applies on restart. VBR caps ride
+# ~50% above typical CQP averages so brief complex scenes never hit the
+# VBV ceiling (visible mush); the byte-budgeted ring absorbs the size.
+# RAM caps are sized for DENSE gameplay bitrates (100+ Mbps sustained),
+# not averages: an 80 MB ring holds ~6 s of a 30 s window at 13 MB/s, so
+# the buffer could never fill. RAM is cheap; the buffer is the product.
+# Quality sits softer than reference to bound file sizes: Medium targets
+# ~50 Mbps at dense 1080p60 (≈190 MB per 30 s). Budgets and VBV caps are
+# untouched (the ring must still hold the full window with headroom).
 _COMPRESSION_PROFILES = {
-    "High": {"cqp": 25, "crf": 25, "x264_preset": "ultrafast",
-             "maxrate_m": 12, "guess_m": 25, "ram_cap_mb": 40},
-    "Medium": {"cqp": 22, "crf": 22, "x264_preset": "superfast",
-               "maxrate_m": 20, "guess_m": 40, "ram_cap_mb": 80},
-    "Low": {"cqp": 18, "crf": 19, "x264_preset": "veryfast",
-            "maxrate_m": 40, "guess_m": 70, "ram_cap_mb": 140},
+    "High": {"cqp": 31, "crf": 31, "x264_preset": "ultrafast",
+             "maxrate_m": 32, "guess_m": 35, "ram_cap_mb": 120},
+    "Medium": {"cqp": 29, "crf": 29, "x264_preset": "superfast",
+               "maxrate_m": 112, "guess_m": 60, "ram_cap_mb": 512},
+    "Low": {"cqp": 19, "crf": 20, "x264_preset": "veryfast",
+            "maxrate_m": 128, "guess_m": 100, "ram_cap_mb": 640},
 }
 
 # Fragment ring I/O
@@ -243,6 +264,7 @@ def _moof_samples(data, moof_off, moof_size, trex):
     return is_sync, base, count
 
 
+
 def _moof_info(data, moof_off, moof_size, trex):
     """First traf of a moof. Returns (is_sync_or_None, base_time_or_None)."""
     is_sync = None
@@ -326,6 +348,7 @@ class Recorder:
         self._live_cap_bps = None
         self._live_fps = None
         self._live_input = "cpu"
+        self._live_transport = None  # "raw" | "compressed" at last probe
         self._active_profile = dict(_COMPRESSION_PROFILES["Medium"])
 
         # Fragment ring: byte-blocks of live fMP4 from ffmpeg stdout.
@@ -337,6 +360,8 @@ class Recorder:
         self._frag_lock = threading.Lock()
         self._frag_deque = collections.deque()
         self._frag_bytes = 0
+        self._frag_rate_hist = collections.deque()
+        self._frag_pushed_total = 0
         self._frag_budget = self._frag_budget_bytes()
         self._init_seg = None          # cached fMP4 init segment (ftyp+moov)
         self._init_pending = bytearray()
@@ -347,6 +372,13 @@ class Recorder:
         # pacing overruns that skew nominal stream_time vs wall).
         self._feed_walls = collections.deque(maxlen=1024)
         self._feed_total = 0           # absolute stream frame counter
+        # Fresh-feed walls: NVENC skips byte-identical duplicate frames
+        # WITHOUT emitting samples, so ring samples are 1:1 with FRESH
+        # feeds only (changed pixels always emit). Count-mapping the
+        # save window against fresh feeds is therefore exact; mapping
+        # against all feeds would drift whenever duplicates are skipped.
+        self._fresh_walls = collections.deque(maxlen=1024)
+        self._fresh_total = 0
 
         # Audio replay buffers: (pcm bytes, sr, ch, chunk_start_mono).
         # Tiny (~6 MB for 30 s stereo) vs hundreds of MB of video.
@@ -362,9 +394,51 @@ class Recorder:
         self._cap_thread = None
         self._write_thread = None
         self._read_thread = None
+        self._preview_thread = None
+        self._preview_thread = None
+        # Native core (opt-in): owns capture+feed when active; Python
+        # loops stay parked. Absent/unbuilt .pyd can never engage it.
+        self._nc = None
+        self._nc_active = False
+        self._nc_drain = None
+        self._nc_sup = None
+        self._nc_qpc0 = 0
+        self._nc_mono0 = 0.0
+        self._nc_freq = 1
+        self._nc_output = None
+        self._nc_region = None
+        self._nc_outwh = None
         self._latest_lock = threading.Lock()
-        self._latest_jpeg = None
-        self._latest_seq = 0  # bumped per fresh capture; writer skips
+        self._latest_frame = None  # freshest raw BGR frame (no-copy handoff)
+        self._latest_seq = 0  # capture-side stamp (preview + raw writer)
+        # Compressed-transport JPEG state (unused in raw mode).
+        self._enc_queue = queue.Queue(maxsize=3)
+        self._enc_threads = []  # JPEG worker pool (compressed only)
+        self._latest_jpeg = None  # freshest JPEG bytes (compressed writer)
+        self._jpeg_seq = 0  # capture-side stamp of the stored JPEG
+        self._jpeg_wh = None  # target size pinned at stream launch
+        self._enc_drops = 0  # frames discarded: workers slower than capture
+        # Continuous session recording (opt-in long-form capture; replay
+        # ring keeps rolling independently via tee, so F9 still works).
+        # Video + audio spill straight to disk; NOTHING unbounded in RAM.
+        self.is_continuous_recording = False
+        self._sess_lock = threading.Lock()
+        self._sess_dir = None  # per-session scratch dir (video + audio)
+        self._sess_video_path = None
+        self._sess_video_fh = None
+        self._sess_video_bytes = 0
+        self._sess_broken = None  # spill failure note (partial kept)
+        self._sess_spill_errors = 0  # consecutive spill failures (3 = break)
+        self._sess_audio = {}  # kind -> [fh, path] (mic/sys/app_<exe>)
+        self._sess_feed_walls = []  # unbounded per-segment wall lists
+        self._sess_fresh_walls = []
+        self._sess_feed_total = 0
+        self._sess_fresh_total = 0
+        self._sess_wall_start = 0.0
+        self._sess_last_feed = 0.0
+        self._sess_dest = None  # final output path (no part suffix if 1 seg)
+        self._sess_seg = 0  # segments closed so far
+        self._sess_finalizer = None  # background segment-finalize thread
         # re-feeding an unchanged frame (same pixels cost a full
         # encode each slot; a gap reads identically to a duplicate).
         self._audio_threads = []
@@ -379,10 +453,14 @@ class Recorder:
         self._loopback_dev = None
         self._stream_generation = 0
         self._stream_restarts = 0
+        self._stream_geom = None  # native pipe geometry at launch
         self._ffmpeg_proc = None
 
         # Diagnostics
         self._recording_start = 0.0
+        self.cap_fps = 60  # configured capture rate (status readout)
+        self.capture_frozen = False  # latched by _watch_frozen_capture
+        self._frozen_notified_gen = -1
         self._mic_start_time = 0.0
         self._sys_start_time = 0.0
         self.last_stream_error = None
@@ -394,10 +472,18 @@ class Recorder:
 
         # Camera
         self.camera = None
+        self._pad_wh = None  # cached output size for region padding
+        # Capture target state (monitor row vs active-window follow).
+        self._cap_output = None
+        self._cap_region = None
+        self._cap_key = None
+        self._cap_label = "Monitor 1"
+        self._output_map = None  # dxcam idx -> screeninfo geometry cache
 
         # Preview thumbnail for UI (JPEG bytes, throttled)
         self.preview_jpeg = None
         self.preview_lock = threading.Lock()
+        self.preview_enabled = True  # UI clears when its window loses focus
 
         # Audio error visibility
         self.audio_errors = collections.deque(maxlen=50)
@@ -447,22 +533,128 @@ class Recorder:
             return ("h264_qsv", "fast", ["-global_quality", "22"])
         return ("libx264", "ultrafast", ["-crf", "22"])
 
+    def _transport_mode(self):
+        """Live pipe transport: "raw" (BGR24, default) or "compressed".
+
+        Compressed = JPEG/image2pipe via the encode worker pool (~20x
+        less pipe bandwidth at the cost of Python encode CPU + baked-in
+        pre-compression artifacts). Applies on next start().
+        """
+        try:
+            if str(self.settings.get("transport_mode", "raw")).strip().lower() == "compressed":
+                return "compressed"
+        except (AttributeError, TypeError):
+            pass
+        return "raw"
+
+    def _stream_geometry(self):
+        """(native_w, native_h, out_w, out_h) for the live stream.
+
+        native = dxcam output size (pipe -s + pad target: region
+        captures are padded up to this, so geometry never changes
+        mid-stream); out = settings resolution (scale-filter target).
+        """
+        try:
+            res = str(self.settings.get("resolution", "1920x1080"))
+            ow, oh = res.split("x")
+            ow, oh = max(16, int(ow)), max(16, int(oh))
+        except (AttributeError, TypeError, ValueError):
+            ow, oh = 1920, 1080
+        nw, nh = ow, oh
+        try:
+            idx = self._cap_output
+            if idx is None:
+                idx = max(0, int(self.settings.get("monitor_index", 0)))
+            geom = (self._dxcam_output_map() or {}).get(int(idx))
+            if geom is not None:
+                nw, nh = max(16, int(geom[2])), max(16, int(geom[3]))
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return (nw, nh), (ow, oh)
+
+    def _video_filters(self, native, out, encoder):
+        """Scale filter chain (empty when native == target).
+
+        NVENC: format (CPU) + upload + scale_cuda (GPU resample).
+        Verified against bundled ffmpeg 8.0.1: `scale_nvenc` does
+        not exist (Unknown filter), and bare
+        `hwupload_cuda,scale_cuda` fails on RGB input
+        (scale_cuda: Unsupported conversion rgb0 -> nv12), while
+        `format=nv12,hwupload_cuda,scale_cuda=W:H` exits 0.
+        No scale_amf filter exists in this build (-filters lists
+        only scale_cuda/scale_d3d11/scale_qsv/scale_vaapi), so AMF
+        keeps plain CPU scale; QSV keeps plain scale too (a qsv
+        chain needs qsv hardware frames, unverifiable on this box,
+        and guessed chains are not shipped).
+        Plain CPU scale only otherwise (libx264/AMF/QSV/unknown).
+
+        Compressed transport always returns []: frames are resized to
+        the target before JPEG encode, so the pipe already matches.
+        """
+        try:
+            if self._transport_mode() == "compressed":
+                return []
+            (nw, nh), (ow, oh) = native, out
+            if (nw, nh) == (ow, oh):
+                return []
+            if encoder == "h264_nvenc":
+                return ["-vf",
+                        "format=nv12,hwupload_cuda,"
+                        "scale_cuda=%d:%d" % (ow, oh)]
+            return ["-vf", "scale=%d:%d" % (ow, oh)]
+        except (AttributeError, TypeError, ValueError):
+            return []
+
     def _live_input_flags(self):
-        """Input flag set for the live pipe (CPU MJPEG decode).
+        """Input flag set for the live pipe (raw BGR24 system memory).
 
         (A GPU-decode variant was trialed and removed: mjpeg_cuvid init
         hangs nondeterministically on some sessions instead of failing,
-        stalling startup. CPU decode is verified on all paths.)
+        stalling startup.)
 
         Wall-clock arrival timestamps: under gaming load the writer can
         feed fewer frames than wall slots (blocked pipe). Count-based
         timestamps would then compress 30 s of wall into a short sped-up
         clip; arrival timestamps keep stream duration == wall time, so
         shortfalls read as judder and audio stays honest.
+
+        Shallow demux queue (16 packets ~= 0.27 s): timestamps are
+        stamped when the demuxer READS, so a deep queue lets them lag
+        the wall by up to seconds under load (measured +2.2 s at 128).
+        A shallow queue caps the lag; earlier blocking just shows as
+        judder, which is the safe direction.
+
+        Transport is raw BGR24 (local RAM pipe): no JPEG roundtrip.
+        Size is the NATIVE output size (region captures are padded up
+        to it in capture, so geometry never changes mid-stream; the
+        scale filter below handles downscaling when configured).
+
+        Compressed transport instead ingests image2pipe/mjpeg (frames
+        pre-sized + pre-compressed by the worker pool): no -s needed.
         """
-        return ["-thread_queue_size", "1024",
+        try:
+            if self._transport_mode() == "compressed":
+                return ["-thread_queue_size", "16",
+                        "-use_wallclock_as_timestamps", "1",
+                        "-f", "image2pipe", "-vcodec", "mjpeg"]
+        except (AttributeError, TypeError, ValueError):
+            pass
+        try:
+            (nw, nh), _ = self._stream_geometry()
+        except (AttributeError, TypeError, ValueError):
+            nw, nh = 1920, 1080
+        return ["-thread_queue_size", "16",
                 "-use_wallclock_as_timestamps", "1",
-                "-f", "image2pipe", "-vcodec", "mjpeg"]
+                "-f", "rawvideo", "-pix_fmt", "bgr24",
+                "-s", "%dx%d" % (nw, nh)]
+
+    def _use_gpu(self):
+        """GPU encode allowed? User toggle (default on); same quality
+        mapping either way, encoder chain just skips GPU entries."""
+        try:
+            return bool(self.settings.get("use_gpu", True))
+        except (AttributeError, TypeError):
+            return True
 
     def _compression_profile(self):
         """Normalized compression profile from settings (default Medium)."""
@@ -485,23 +677,40 @@ class Recorder:
         bufsize = "%dM" % (maxrate_m * 2)
         guess_cap = int(prof["guess_m"] * 1_000_000 * scale)
         cqp = prof["cqp"]
+        # Cap x264 threads: the default (~1.5x cores) oversubscribes badly
+        # next to a game, and contention collapses throughput below what
+        # fewer well-fed threads sustain. Still plenty for 60 fps.
+        x264_threads = str(min(16, max(4, int(fps) // 10)))
+        x264 = ("libx264", ["-preset", prof["x264_preset"], "-tune", "zerolatency",
+                            "-threads", x264_threads,
+                            "-crf", str(prof["crf"]), "-maxrate", vbr_cap,
+                            "-bufsize", bufsize, "-bf", "0"],
+                int(prof["maxrate_m"] * 1_000_000 * scale))
+        if not self._use_gpu():
+            # CPU-only mode: same High/Medium/Low quality mapping, no GPU.
+            return [x264]
+        # OBS-style lean NVENC: pure CQP (no VBV/maxrate logic at all),
+        # p1 single-rapid-pass preset, lookahead explicitly off, forced
+        # IDR keyframes. The encoder chip just stamps out fixed-quality
+        # frames; maxrate/bufsize caps would only add rate-control work.
+        # (Bitrate is unbounded by design; the byte-budgeted ring and
+        # ram_cap_mb absorb it. VBR+CQ + p4 was trialed and removed:
+        # lookahead + VBV bookkeeping cost GPU cycles for zero quality
+        # gain at fixed CQP.)
         return [
-            ("h264_nvenc", ["-preset", "p4", "-rc", "vbr", "-cq", str(cqp),
-                            "-maxrate", vbr_cap, "-bufsize", bufsize,
-                            "-bf", "0"], int(prof["maxrate_m"] * 1_000_000 * scale)),
+            ("h264_nvenc", ["-preset", "p1", "-rc", "constqp",
+                            "-qp", str(cqp), "-rc-lookahead", "0",
+                            "-forced-idr", "1", "-bf", "0"], int(prof["maxrate_m"] * 1_000_000 * scale)),
             ("h264_amf", ["-quality", "speed", "-rc", "cqp",
                           "-qp_i", str(cqp), "-qp_p", str(cqp)], guess_cap),
             ("h264_qsv", ["-preset", "fast", "-global_quality", str(cqp)], guess_cap),
-            ("libx264", ["-preset", prof["x264_preset"], "-tune", "zerolatency",
-                         "-crf", str(prof["crf"]), "-maxrate", vbr_cap,
-                         "-bufsize", bufsize, "-bf", "0"],
-             int(prof["maxrate_m"] * 1_000_000 * scale)),
+            x264,
         ]
 
     def _ensure_live_args(self, fps=60):
         """Validate the full live chain end-to-end; fall back until one works.
 
-        Builds a probe MJPEG file and runs each candidate encoder through
+        Builds a probe raw-BGR file and runs each candidate encoder through
         the real fragmented-MP4 pipeline to null.
         """
         if self._live_encoder is not None:
@@ -515,14 +724,27 @@ class Recorder:
         except Exception:
             available = ""
         last_err = "ffmpeg not found"
-        probe = tempfile.mktemp(suffix=".mjpeg")
         try:
-            gen = subprocess.run(
-                [self._ffmpeg_path(), "-y",
-                 "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30:duration=1",
-                 "-c:v", "mjpeg", "-q:v", "3", probe],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=30, creationflags=_NO_WINDOW)
+            tmode_c = (self._transport_mode() == "compressed")
+        except (AttributeError, TypeError):
+            tmode_c = False
+        probe = tempfile.mktemp(suffix=".mjpeg" if tmode_c else ".raw")
+        try:
+            (pnw, pnh), pout = self._stream_geometry()
+            if tmode_c:
+                gen = subprocess.run(
+                    [self._ffmpeg_path(), "-y",
+                     "-f", "lavfi", "-i", "testsrc=size=%dx%d:rate=30:duration=1" % (pout[0], pout[1]),
+                     "-c:v", "mjpeg", "-q:v", "3", probe],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=30, creationflags=_NO_WINDOW)
+            else:
+                gen = subprocess.run(
+                    [self._ffmpeg_path(), "-y",
+                     "-f", "lavfi", "-i", "testsrc=size=%dx%d:rate=30:duration=1" % (pnw, pnh),
+                     "-pix_fmt", "bgr24", "-f", "rawvideo", probe],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=30, creationflags=_NO_WINDOW)
             if gen.returncode != 0 or not os.path.isfile(probe):
                 raise RuntimeError("probe build failed")
             for enc, args, cap in self._live_candidates(fps):
@@ -530,8 +752,9 @@ class Recorder:
                     continue
                 cmd = ([self._ffmpeg_path(), "-y"]
                        + self._live_input_flags()
-                       + ["-framerate", str(fps), "-i", probe,
-                          "-c:v", enc] + args + ["-g", "15",
+                       + ["-framerate", str(fps), "-i", probe]
+                       + self._video_filters((pnw, pnh), pout, enc)
+                       + ["-c:v", enc] + args + ["-g", "15",
                           "-pix_fmt", "yuv420p"])
                 cmd += ["-force_key_frames", "expr:gte(t,n_forced*0.25)",
                         "-f", "mp4",
@@ -550,6 +773,7 @@ class Recorder:
                     self._live_args = args
                     self._live_cap_bps = cap
                     self._live_input = "cpu"
+                    self._live_transport = self._transport_mode()
                     self._encoder = enc  # keep legacy attr in sync
                     return
                 last_err = proc.stderr.decode(
@@ -572,7 +796,7 @@ class Recorder:
         cap = self._live_cap_bps or 40_000_000
         buf_sec = max(1, int(self.settings.get("buffer_seconds", 20)))
         derived = cap / 8.0 * buf_sec * _FRAG_HEADROOM
-        return int(min(prof_cap, derived, 320 * 1024 * 1024))
+        return int(min(prof_cap, derived, 768 * 1024 * 1024))
 
     def _frag_maxlen(self):
         """Block-count backstop (byte budget in _push_frag is authoritative)."""
@@ -585,29 +809,108 @@ class Recorder:
         budget = self._frag_budget
         while self._frag_bytes > budget and len(self._frag_deque) > 1:
             self._frag_bytes -= len(self._frag_deque.popleft())
+        # Bitrate tracker for honest time-coverage readout (see
+        # frag_fill_frac): cumulative bytes vs wall, short window.
+        try:
+            now = time.monotonic()
+            hist = self._frag_rate_hist
+            hist.append((now, self._frag_pushed_total + len(chunk)))
+            self._frag_pushed_total += len(chunk)
+            while len(hist) > 2 and now - hist[0][0] > 10.0:
+                hist.popleft()
+        except (AttributeError, TypeError):
+            pass
+
+    def _resize_to_target(self, frame):
+        """Resize frame to the configured resolution (compressed mode).
+
+        Every fed frame is exactly the target size, so the MJPEG pipe
+        never changes dims mid-stream (a dims change would corrupt it).
+        The target is pinned at stream launch: a settings change mid-run
+        stays inert until the next start, like the raw pipe.
+        """
+        try:
+            wh = self._jpeg_wh
+        except AttributeError:
+            wh = None
+        if wh is not None:
+            try:
+                tw, th = max(16, int(wh[0])), max(16, int(wh[1]))
+            except (TypeError, ValueError, IndexError):
+                tw, th = 1920, 1080
+        else:
+            try:
+                res = str(self.settings.get("resolution", "1920x1080"))
+                tw, th = res.split("x")
+                tw, th = max(16, int(tw)), max(16, int(th))
+            except (AttributeError, TypeError, ValueError):
+                tw, th = 1920, 1080
+        try:
+            h, w = frame.shape[:2]
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return frame
+        if w == tw and h == th:
+            return frame
+        return cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LINEAR)
+
+    def _ring_time_span(self):
+        """Estimated wall seconds currently held in the ring."""
+        try:
+            hist = self._frag_rate_hist
+            if len(hist) >= 2:
+                (t0, b0), (t1, b1) = hist[0], hist[-1]
+                if t1 > t0 and b1 > b0:
+                    rate = (b1 - b0) / (t1 - t0)  # bytes/sec actual
+                    if rate > 0:
+                        return self._frag_bytes / rate
+            # Cold start / stalled stream: elapsed recording time.
+            return time.monotonic() - self._stream_wall_start
+        except (AttributeError, TypeError, ValueError, IndexError,
+                ZeroDivisionError):
+            return 0.0
 
     def frag_ceiling_mb(self):
         """Current RAM ceiling of the fragment ring in MB (diagnostic)."""
         return self._frag_budget / 1024 / 1024
 
     def frag_fill_frac(self):
-        """0..1 ring fullness by bytes (for UI)."""
+        """0..1 replay-buffer fullness as TIME coverage (wall span held /
+        buffer_seconds), not bytes: CQP streams use far less than the
+        max bitrate the byte budget assumes, so a byte ratio would crawl
+        for minutes while a full time window is already saved. Span comes
+        from the measured receive rate, so genuine byte-eviction (dense
+        high-bitrate footage outgrowing the budget) still reads <100%."""
         try:
-            return min(1.0, self._frag_bytes / max(1, self._frag_budget))
-        except (AttributeError, TypeError):
+            if not getattr(self, "recording", False):
+                return 0.0
+            buf_sec = max(1, int(self.settings.get("buffer_seconds", 20)))
+            span = self._ring_time_span()
+            return min(1.0, max(0.0, span / float(buf_sec)))
+        except (AttributeError, TypeError, ValueError):
             return 0.0
 
-    def _resize_frame(self, frame):
-        """Resize frame to the configured resolution."""
-        res = self.settings.get("resolution", "1920x1080")
+    def _pad_to_output(self, frame, wh):
+        """Pad a region capture up to the full output size (black bars).
+
+        Keeps pipe geometry constant across window switches so the
+        stream never needs relaunching; aspect stays honest (no
+        stretching). wh comes from the cached output size.
+        """
         try:
-            tw, th = map(int, res.split("x"))
-        except (ValueError, AttributeError):
-            tw, th = 1920, 1080
-        h, w = frame.shape[:2]
-        if w == tw and h == th:
+            nw, nh = int(wh[0]), int(wh[1])
+            h, w = frame.shape[:2]
+        except (AttributeError, TypeError, ValueError, IndexError):
             return frame
-        return cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LINEAR)
+        if w == nw and h == nh:
+            return frame
+        if w > nw or h > nh:
+            return frame
+        try:
+            canvas = np.zeros((nh, nw, 3), dtype=np.uint8)
+            canvas[:h, :w] = frame
+            return canvas
+        except (AttributeError, TypeError, ValueError):
+            return frame
 
     def _reset_buffer_size(self):
         """Apply buffer_seconds live: resize audio rings, wall ring and
@@ -679,8 +982,13 @@ class Recorder:
         gop = max(10, fps // 4)  # ~0.25 s fragments: tight cut granularity
         cmd = [self._ffmpeg_path(), "-y"]
         cmd += self._live_input_flags()
-        cmd += ["-framerate", str(fps), "-i", "pipe:0",
-                "-c:v", self._live_encoder]
+        cmd += ["-framerate", str(fps), "-i", "pipe:0"]
+        try:
+            native, out = self._stream_geometry()
+            cmd += self._video_filters(native, out, self._live_encoder)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        cmd += ["-c:v", self._live_encoder]
         cmd += self._live_args
         # Belt and suspenders for cut granularity: periodic GOP plus
         # wall-clock forced keyframes (encoder GOP alone proved
@@ -696,6 +1004,14 @@ class Recorder:
     def _launch_stream(self, fps):
         """Spawn the live encoder. Returns (proc, wall_start)."""
         wall_start = time.monotonic()
+        try:
+            self._stream_geom = self._stream_geometry()[0]
+        except (AttributeError, TypeError, ValueError):
+            pass
+        try:
+            self._jpeg_wh = self._stream_geometry()[1]
+        except (AttributeError, TypeError, ValueError):
+            pass
         proc = subprocess.Popen(
             self._live_cmd(fps),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -727,23 +1043,80 @@ class Recorder:
             except (subprocess.TimeoutExpired, OSError):
                 pass
 
-    def _capture_loop(self, fps, generation):
-        """Encode the freshest screen frame to JPEG as fast as possible.
+    def _watch_frozen_capture(self, skip_streak, generation):
+        """Latch capture_frozen when frames are identical for 90 s+ while
+        the user is actively using the PC. Classic cause: an exclusive
+        fullscreen game bypassing DWM, so duplication is frozen. The UI
+        turns the latch into a one-time hint (borderless mode)."""
+        try:
+            notified_gen = self._frozen_notified_gen
+        except (AttributeError, TypeError):
+            notified_gen = -1
+            try:
+                self._frozen_notified_gen = -1
+            except (AttributeError, TypeError):
+                pass
+        if notified_gen == generation:
+            return
+        if skip_streak < 900:
+            try:
+                self.capture_frozen = False
+            except (AttributeError, TypeError):
+                pass
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
 
-        Stores it as _latest_jpeg; the writer thread emits wall-paced
-        slots from it (duplicating under load for exact CFR output).
-        Identical frames skip the encode entirely (byte-identical output
-        for zero CPU); a forced refresh caps staleness on slow fades.
+            class _LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.UINT),
+                            ("dwTime", wintypes.DWORD)]
+
+            lii = _LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(lii)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                return
+            idle_ms = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+            if idle_ms < 0:
+                idle_ms += 2 ** 32
+            if idle_ms > 15000:
+                return  # idle user + static screen = legit, stay quiet
+        except (AttributeError, OSError, ValueError):
+            return
+        try:
+            self.capture_frozen = True
+            self._frozen_notified_gen = generation
+        except (AttributeError, TypeError):
+            pass
+
+    def _capture_loop(self, fps, generation):
+        """Grab the freshest screen frame as fast as possible.
+
+        Only grabs + change-detects here; fresh frames go to the encode
+        worker (own core), thumbnails to the preview worker (own core).
+        cv2 releases the GIL around the heavy ops, so the three stages
+        genuinely run on three CPU cores. Identical frames are dropped
+        before the queue (zero encode CPU); a forced refresh caps
+        staleness on slow fades. Capture always polls at full rate;
+        overload shows as judder downstream (duration stays exact),
+        never as a slowed file.
         """
         target_interval = 1.0 / max(1, fps)
         idle_interval = min(1.0 / 15.0, target_interval * 4)
+        idle_cur = target_interval
         poll_interval = target_interval
-        last_thumb = 0.0
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
-        thumb_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
         prev_small = None
         skip_streak = 0
         next_tick = time.monotonic()
+        last_target = next_tick
+        try:
+            self.cap_fps = fps
+        except (AttributeError, TypeError):
+            pass
+        try:
+            tmode_c = (self._transport_mode() == "compressed")
+        except (AttributeError, TypeError):
+            tmode_c = False
 
         while self.recording and generation == self._stream_generation:
             try:
@@ -752,10 +1125,24 @@ class Recorder:
                 frame = None
                 time.sleep(0.05)
             if frame is not None:
-                resized = self._resize_frame(frame)
-                # Cheap change check on a 64x36 stamp (~0.3 ms) vs a full
-                # q85 encode (~10 ms): static content skips the encode.
-                small = cv2.resize(resized, (64, 36),
+                # Pad region captures up to output size first (monitor
+                # captures already match; this branch then costs one
+                # shape check). Cached size: no map parsing per poll.
+                try:
+                    pad_wh = self._pad_wh
+                except AttributeError:
+                    pad_wh = None
+                if pad_wh is not None:
+                    try:
+                        fh, fw = frame.shape[:2]
+                        if (fw, fh) != (pad_wh[0], pad_wh[1]):
+                            frame = self._pad_to_output(frame, pad_wh)
+                    except (AttributeError, TypeError, ValueError,
+                            IndexError):
+                        pass
+                # Cheap change check on a 64x36 stamp (~0.3 ms): static
+                # content is dropped before storing.
+                small = cv2.resize(frame, (64, 36),
                                    interpolation=cv2.INTER_NEAREST)
                 identical = (prev_small is not None and skip_streak < 30
                              and float(cv2.absdiff(small, prev_small).mean()) < 1.0)
@@ -763,44 +1150,47 @@ class Recorder:
                 del small
                 if identical:
                     skip_streak += 1
-                    del resized, frame
+                    del frame
                     # Static scene: back off polling (detection lag stays
                     # under ~66 ms; full rate resumes on any change)
-                    poll_interval = min(poll_interval * 1.5, idle_interval)
+                    idle_cur = min(idle_cur * 1.5, idle_interval)
+                    self._watch_frozen_capture(skip_streak, generation)
                 else:
                     skip_streak = 0
-                    poll_interval = target_interval
-                    _, jpeg_bytes = cv2.imencode(".jpg", resized, encode_params)
-                    with self._latest_lock:
-                        self._latest_jpeg = jpeg_bytes.tobytes()
-                        self._latest_seq += 1
-                    del jpeg_bytes
-                    # Preview thumbnail throttled to ~7fps, decoded at half
-                    # res (plenty for a 480px preview, ~half the decode cost)
-                    t = time.monotonic()
-                    if t - last_thumb >= 0.25:
-                        last_thumb = t
+                    idle_cur = target_interval
+                    try:
+                        seq = self._latest_seq + 1
+                        with self._latest_lock:
+                            self._latest_frame = frame
+                            self._latest_seq = seq
+                    except Exception:
+                        seq = 0
+                    if tmode_c and seq:
+                        # Compressed pipe: resize to the exact target
+                        # (constant pipe geometry) and let the pool
+                        # encode it; the writer feeds JPEG bytes.
                         try:
-                            with self._latest_lock:
-                                snap = self._latest_jpeg
-                            thumb_src = cv2.imdecode(
-                                np.frombuffer(snap, np.uint8),
-                                cv2.IMREAD_REDUCED_COLOR_2)
-                            if thumb_src is not None:
-                                h, w = thumb_src.shape[:2]
-                                thumb_w = 480
-                                thumb_h = max(1, int(h * thumb_w / w))
-                                thumb = cv2.resize(
-                                    thumb_src, (thumb_w, thumb_h),
-                                    interpolation=cv2.INTER_LINEAR)
-                                _, thumb_jpeg = cv2.imencode(".jpg", thumb, thumb_params)
-                                with self.preview_lock:
-                                    self.preview_jpeg = thumb_jpeg.tobytes()
-                                del thumb, thumb_jpeg, thumb_src
-                        except (cv2.error, ValueError):
+                            if self._enc_queue.full():
+                                try:
+                                    self._enc_drops += 1
+                                except (AttributeError, TypeError):
+                                    pass
+                            else:
+                                try:
+                                    resized = self._resize_to_target(frame)
+                                except Exception:
+                                    resized = frame
+                                self._submit_encode(seq, resized)
+                        except (AttributeError, TypeError):
                             pass
-                        del snap
-                    del resized, frame
+                    del frame
+            poll_interval = idle_cur
+
+            # Follow the configured source ~1 Hz (active window moves).
+            now = time.monotonic()
+            if now - last_target >= 1.0:
+                last_target = now
+                self._resolve_capture_target(fps)
 
             # Pace capture; reset on overrun to avoid catch-up spiral
             next_tick += poll_interval
@@ -810,6 +1200,110 @@ class Recorder:
             else:
                 next_tick = time.monotonic()
 
+    def _submit_encode(self, seq, frame):
+        """Hand a fresh frame to the JPEG workers (compressed transport).
+
+        Drop-oldest when the workers lag (only the latest pixels matter
+        downstream). Jobs carry capture-side stamps so workers finishing
+        out of order can never regress the stored frame.
+        """
+        try:
+            self._enc_queue.put_nowait((seq, frame))
+        except Exception:
+            try:
+                try:
+                    self._enc_queue.get_nowait()
+                except Exception:
+                    pass
+                else:
+                    try:
+                        self._enc_drops += 1
+                    except (AttributeError, TypeError):
+                        pass
+                self._enc_queue.put_nowait((seq, frame))
+            except Exception:
+                pass
+
+    def _encode_loop(self, generation):
+        """JPEG-encode queued frames on pool threads (compressed only).
+
+        Stores each result only when strictly newer than what's stored,
+        so out-of-order completions can never regress the frame.
+        """
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
+        while self.recording and generation == self._stream_generation:
+            try:
+                job_seq, frame = self._enc_queue.get(timeout=0.2)
+            except Exception:
+                continue
+            jpeg = None
+            try:
+                ok, buf = cv2.imencode(".jpg", frame, encode_params)
+                if ok:
+                    jpeg = buf.tobytes()
+            except (cv2.error, ValueError):
+                jpeg = None
+            finally:
+                try:
+                    del frame
+                except (NameError, UnboundLocalError):
+                    pass
+            if jpeg is not None:
+                try:
+                    with self._latest_lock:
+                        if job_seq > self._jpeg_seq:
+                            self._latest_jpeg = jpeg
+                            self._jpeg_seq = job_seq
+                except Exception:
+                    pass
+                del jpeg
+
+    def _preview_loop(self, generation):
+        """Render preview thumbnails on its own core, ~4 Hz.
+
+        Scaled straight from the raw frame (no JPEG roundtrip), plenty
+        for a 480px preview. Runs only when a fresh frame landed.
+        """
+        thumb_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
+        last_seq = -1
+        while self.recording and generation == self._stream_generation:
+            time.sleep(0.25)
+            if not self.recording or generation != self._stream_generation:
+                break
+            try:
+                enabled = bool(self.preview_enabled)
+            except (AttributeError, TypeError):
+                enabled = True
+            if not enabled:
+                continue  # window unfocused: nobody watches, skip the work
+            try:
+                with self._latest_lock:
+                    seq = self._latest_seq
+                    snap = self._latest_frame
+            except Exception:
+                continue
+            if snap is None or seq == last_seq:
+                continue
+            last_seq = seq
+            try:
+                h, w = snap.shape[:2]
+                thumb_w = 480
+                thumb_h = max(1, int(h * thumb_w / w))
+                thumb = cv2.resize(
+                    snap, (thumb_w, thumb_h),
+                    interpolation=cv2.INTER_AREA)
+                _, thumb_jpeg = cv2.imencode(".jpg", thumb, thumb_params)
+                with self.preview_lock:
+                    self.preview_jpeg = thumb_jpeg.tobytes()
+                del thumb, thumb_jpeg
+            except (cv2.error, ValueError, AttributeError, TypeError):
+                pass
+            finally:
+                try:
+                    del snap
+                except (NameError, UnboundLocalError):
+                    pass
+
     def _write_loop(self, fps, generation):
         """Emit wall-paced slots to ffmpeg stdin.
 
@@ -818,12 +1312,31 @@ class Recorder:
         load read as judder, never as a sped-up clip, and audio can
         never overhang the video.
 
-        Unchanged frames are NOT re-fed every slot: a gap reads
-        identically to a duplicate but costs no encode. A 2 Hz minimum
-        cadence keeps fragment/cut granularity tight on static scenes.
+        Unchanged frames are NOT re-fed every slot -- EXCEPT on GPU
+        encoders (NVENC/AMF/QSV), which buffer output indefinitely on
+        sparse input and starve the ring; there every slot is fed so
+        fragments stream continuously. A gap still reads identically to
+        a duplicate. A 2 Hz minimum cadence keeps fragment/cut
+        granularity tight on static scenes (libx264 honors forced keys
+        on sparse input, so it can skip freely).
+        The first ~1.5 s of a stream always feeds every slot so the
+        muxer primes (init + first keyframe) immediately.
+
+        Frames go over the pipe as a raw memory view (no per-slot
+        allocation: tobytes() on 6 MB frames churns ~700 MB/s through
+        the allocator and dwarfs the encode it replaced).
         """
         target_interval = 1.0 / max(1, fps)
         min_interval = 0.5
+        prime_feeds = 90
+        # libx264 streams fine on sparse input (honors forced keys);
+        # GPU encoders buffer output indefinitely when starved, so only
+        # libx264 may skip re-feeding unchanged frames.
+        skip_allowed = (self._live_encoder == "libx264")
+        try:
+            tmode_c = (self._transport_mode() == "compressed")
+        except (AttributeError, TypeError):
+            tmode_c = False
         next_tick = time.monotonic()
         proc = self._ffmpeg_proc
         last_sent_seq = -1
@@ -831,31 +1344,94 @@ class Recorder:
         while self.recording and generation == self._stream_generation:
             if proc is None or proc.poll() is not None:
                 break
-            with self._latest_lock:
-                jpeg = self._latest_jpeg
-                seq = self._latest_seq
+            if tmode_c:
+                with self._latest_lock:
+                    payload = self._latest_jpeg
+                    seq = self._jpeg_seq
+            else:
+                with self._latest_lock:
+                    payload = self._latest_frame
+                    seq = self._latest_seq
             now = time.monotonic()
-            if jpeg is not None and (
-                    seq != last_sent_seq
+            priming = self._feed_total < prime_feeds
+            is_fresh = (seq != last_sent_seq)
+            if payload is not None and (
+                    priming or is_fresh or not skip_allowed
                     or now - last_sent_wall >= min_interval):
                 try:
-                    proc.stdin.write(jpeg)
-                except (BrokenPipeError, OSError, ValueError):
-                    break
-                t_wall = time.monotonic()
-                self._last_feed_wall = t_wall
-                last_sent_wall = t_wall
-                last_sent_seq = seq
-                with self._frag_lock:
-                    self._feed_walls.append(t_wall)
-                    self._feed_total += 1
-                del jpeg
+                    view = memoryview(payload)
+                except TypeError:
+                    view = None
+                fed = False
+                if view is not None:
+                    try:
+                        while len(view) > 0:
+                            written = proc.stdin.write(view)
+                            if written is None:
+                                break
+                            view = view[written:]
+                        else:
+                            fed = True
+                    except (BrokenPipeError, OSError, ValueError):
+                        break
+                    finally:
+                        try:
+                            del view
+                        except (NameError, UnboundLocalError):
+                            pass
+                if fed:
+                    t_wall = time.monotonic()
+                    self._last_feed_wall = t_wall
+                    last_sent_wall = t_wall
+                    last_sent_seq = seq
+                    with self._frag_lock:
+                        self._feed_walls.append(t_wall)
+                        self._feed_total += 1
+                        if is_fresh:
+                            self._fresh_walls.append(t_wall)
+                            self._fresh_total += 1
+                    try:
+                        if self.is_continuous_recording:
+                            self._sess_note_feed(t_wall, is_fresh)
+                    except Exception:
+                        pass
+                del payload
             next_tick += target_interval
             delay = next_tick - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
             elif delay < -0.5:
                 next_tick = time.monotonic()  # cap catch-up burst
+
+    def _ingest_block(self, chunk):
+        """Fold one stdout block into init-seg / fragment ring.
+
+        Shared by the subprocess reader and the native-core drain loop.
+        Active sessions ALSO tee the raw bytes to disk (bounded RAM).
+        """
+        if self._init_seg is None:
+            self._init_pending.extend(chunk)
+            if len(self._init_pending) > _INIT_PENDING_MAX:
+                self.last_stream_error = "init segment too large"
+                return False
+            end = _find_init_end(self._init_pending)
+            if end is not None:
+                with self._frag_lock:
+                    self._init_seg = bytes(self._init_pending[:end])
+                    rest = bytes(self._init_pending[end:])
+                    if rest:
+                        self._push_frag(rest)
+                del self._init_pending
+                self._init_pending = bytearray()
+        else:
+            with self._frag_lock:
+                self._push_frag(chunk)
+        try:
+            if self.is_continuous_recording:
+                self._sess_write_video(chunk)
+        except Exception:
+            pass
+        return True
 
     def _read_loop(self, proc, generation):
         """Read fMP4 blocks from stdout into the rolling ring."""
@@ -867,23 +1443,8 @@ class Recorder:
                     break
                 if not chunk:
                     break  # EOF: encoder exited
-                if self._init_seg is None:
-                    self._init_pending.extend(chunk)
-                    if len(self._init_pending) > _INIT_PENDING_MAX:
-                        self.last_stream_error = "init segment too large"
-                        break
-                    end = _find_init_end(self._init_pending)
-                    if end is not None:
-                        with self._frag_lock:
-                            self._init_seg = bytes(self._init_pending[:end])
-                            rest = bytes(self._init_pending[end:])
-                            if rest:
-                                self._push_frag(rest)
-                        del self._init_pending
-                        self._init_pending = bytearray()
-                else:
-                    with self._frag_lock:
-                        self._push_frag(chunk)
+                if not self._ingest_block(chunk):
+                    break
                 del chunk
         finally:
             try:
@@ -893,6 +1454,252 @@ class Recorder:
             if (self.recording and generation == self._stream_generation
                     and self._stream_restarts < _RESTART_MAX):
                 self._restart_stream("encoder output ended")
+
+    # --------------------------------------------------------
+    # NATIVE CORE (opt-in C++ capture+feed; Python loops stay default)
+    # --------------------------------------------------------
+
+    def _native_wanted(self):
+        """Native path eligible? Flag on + .pyd present + raw transport.
+
+        v1 of the native core only speaks raw BGR24; compressed mode
+        stays on the Python worker pool either way.
+        """
+        try:
+            if not bool(self.settings.get("use_native_core", False)):
+                return False
+        except (AttributeError, TypeError):
+            return False
+        if _ncore is None:
+            return False
+        try:
+            return self._transport_mode() == "raw"
+        except (AttributeError, TypeError):
+            return False
+
+    def _nc_map_output(self, out_idx):
+        """Map a dxcam output_idx to a DXGI output index by geometry.
+
+        DXGI and dxcam enumerate independently (like screeninfo did),
+        so match (x, y, w, h), never position. Returns None on mismatch
+        (caller falls back to the Python loops).
+        """
+        try:
+            geom = (self._dxcam_output_map() or {}).get(int(out_idx))
+            if geom is None:
+                return None
+            want = (int(geom[0]), int(geom[1]), int(geom[2]), int(geom[3]))
+            for i, (ox, oy, ow, oh) in enumerate(_ncore.RecorderCore.list_outputs()):
+                if (int(ox), int(oy), int(ow), int(oh)) == want:
+                    return i
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return None
+
+    def _nc_merge_feed_log(self, core):
+        """Fold native feed stamps into the wall-clock frame map."""
+        try:
+            entries = core.drain_feed_log()
+        except Exception:
+            return 0
+        if not entries:
+            return 0
+        try:
+            freq = float(self._nc_freq or 1)
+            mono0 = float(self._nc_mono0)
+            qpc0 = int(self._nc_qpc0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        n = 0
+        for tick, fresh in entries:
+            try:
+                t_wall = mono0 + (int(tick) - qpc0) / freq
+            except (TypeError, ValueError):
+                continue
+            self._last_feed_wall = t_wall
+            with self._frag_lock:
+                self._feed_walls.append(t_wall)
+                self._feed_total += 1
+                if fresh:
+                    self._fresh_walls.append(t_wall)
+                    self._fresh_total += 1
+            try:
+                if self.is_continuous_recording:
+                    self._sess_note_feed(t_wall, fresh)
+            except Exception:
+                pass
+            n += 1
+        return n
+
+    def _start_native_stream(self, fps, generation):
+        """Launch capture+feed in the native core. Returns core or None.
+
+        None = fall back to the Python loops (state untouched on failure
+        beyond last_stream_error, so the caller can proceed normally).
+        Requires the capture target already resolved.
+        """
+        if _ncore is None:
+            return None
+        try:
+            (nw, nh), (ow, oh) = self._stream_geometry()
+            out_idx = self._cap_output
+            if out_idx is None:
+                out_idx = max(0, int(self.settings.get("monitor_index", 0)))
+            dxgi_idx = self._nc_map_output(out_idx)
+            if dxgi_idx is None:
+                self.last_stream_error = "native core: output not found"
+                return None
+            region = []
+            if self._cap_region is not None:
+                try:
+                    region = [int(v) for v in self._cap_region]
+                    if len(region) != 4:
+                        region = []
+                except (TypeError, ValueError):
+                    region = []
+            argv = self._live_cmd(fps)
+            core = _ncore.RecorderCore()
+            if not core.start(argv, int(nw), int(nh), int(ow), int(oh),
+                              int(fps), int(dxgi_idx), region):
+                try:
+                    self.last_stream_error = ("native core: %s" % core.last_error())
+                except Exception:
+                    self.last_stream_error = "native core start failed"
+                try:
+                    core.stop()
+                except Exception:
+                    pass
+                return None
+            self._nc_qpc0 = int(_ncore.RecorderCore.qpc_now())
+            self._nc_mono0 = time.monotonic()
+            try:
+                self._nc_freq = int(_ncore.RecorderCore.qpc_frequency())
+            except Exception:
+                self._nc_freq = 1
+            self._stream_wall_start = self._nc_mono0
+            self._nc = core
+            self._nc_active = True
+            self._nc_output = out_idx
+            self._nc_region = (tuple(region) if region else None)
+            self._nc_outwh = (int(ow), int(oh))
+            return core
+        except Exception as exc:
+            self.last_stream_error = "native core: %s" % exc
+            try:
+                self._nc = None
+                self._nc_active = False
+            except (AttributeError, TypeError):
+                pass
+            return None
+
+    def _native_drain_loop(self, core, generation):
+        """Pump native stdout into the ring; merge feed stamps; fps meter."""
+        sec_count = 0
+        sec_start = time.monotonic()
+        try:
+            while self.recording and generation == self._stream_generation:
+                try:
+                    chunk = core.read_stdout(_FRAG_BLOCK)
+                except Exception:
+                    break
+                if chunk:
+                    if not self._ingest_block(chunk):
+                        break
+                    del chunk
+                else:
+                    time.sleep(0.01)
+                try:
+                    n = self._nc_merge_feed_log(core)
+                    sec_count += n
+                except Exception:
+                    pass
+                now = time.monotonic()
+                if now - sec_start >= 1.0:
+                    try:
+                        self.cap_fps = int(sec_count / max(0.25, now - sec_start))
+                    except (AttributeError, TypeError):
+                        pass
+                    sec_count = 0
+                    sec_start = now
+                try:
+                    alive = bool(core.child_alive())
+                except Exception:
+                    alive = False
+                if not alive:
+                    try:
+                        tail = core.read_stdout(1 << 20)
+                    except Exception:
+                        tail = b""
+                    if tail:
+                        try:
+                            self._ingest_block(tail)
+                        except Exception:
+                            pass
+                        continue
+                    break  # EOF: encoder exited
+        finally:
+            if (self.recording and generation == self._stream_generation
+                    and self._stream_restarts < _RESTART_MAX
+                    and self._nc_active):
+                self._restart_stream("native encoder output ended")
+
+    def _native_sup_loop(self, core, fps, generation):
+        """1 Hz target-follow (reconfigure, no ffmpeg relaunch) + 4 Hz
+        preview handoff into the existing _latest_frame machinery."""
+        tick = 0
+        try:
+            ow, oh = self._nc_outwh or (1920, 1080)
+        except (AttributeError, TypeError, ValueError):
+            ow, oh = 1920, 1080
+        while self.recording and generation == self._stream_generation:
+            time.sleep(0.25)
+            if not self.recording or generation != self._stream_generation:
+                break
+            tick += 1
+            if tick % 4 == 0:
+                try:
+                    self._resolve_capture_target(fps)
+                except Exception:
+                    pass
+                try:
+                    if (self._cap_output != self._nc_output
+                            or self._cap_region != self._nc_region):
+                        dxgi_idx = self._nc_map_output(self._cap_output)
+                        if dxgi_idx is not None:
+                            region = ([int(v) for v in self._cap_region]
+                                      if self._cap_region is not None else [])
+                            try:
+                                core.reconfigure(int(dxgi_idx), region)
+                            except Exception:
+                                pass
+                            else:
+                                self._nc_output = self._cap_output
+                                self._nc_region = self._cap_region
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            try:
+                enabled = bool(self.preview_enabled)
+            except (AttributeError, TypeError):
+                enabled = True
+            if not enabled:
+                continue
+            try:
+                frm = core.get_latest_frame()
+            except Exception:
+                continue
+            if not frm:
+                continue
+            try:
+                arr = np.frombuffer(frm, dtype=np.uint8).reshape(oh, ow, 3)
+            except (ValueError, TypeError):
+                continue
+            try:
+                with self._latest_lock:
+                    self._latest_frame = arr
+                    self._latest_seq += 1
+            except Exception:
+                pass
+            del arr, frm
 
     def _restart_stream(self, reason):
         """Relaunch a dead encoder (bounded); old timeline is discarded."""
@@ -907,13 +1714,113 @@ class Recorder:
         self._stream_generation += 1
         generation = self._stream_generation
         self._stream_restarts += 1
+        # A stream restart breaks the session timeline: close the current
+        # segment and finalize it in the background, then keep recording
+        # into a fresh segment (parts land as <stem>_partNNN.mp4).
+        try:
+            sess_active = bool(self.is_continuous_recording)
+        except (AttributeError, TypeError):
+            sess_active = False
+        if sess_active:
+            try:
+                snap = self._close_session_segment()
+                dest = self._sess_dest
+            except Exception:
+                snap, dest = None, None
+            if snap is not None and dest:
+                try:
+                    part = self._sess_part_path(dest, snap.get("seg", 0))
+                    worker = threading.Thread(
+                        target=self._sess_finalize_bg,
+                        args=(snap, part), daemon=True)
+                    worker.start()
+                except (AttributeError, TypeError, RuntimeError):
+                    pass
         # Prune dead stream threads (no unbounded growth)
-        for attr in ("_cap_thread", "_write_thread", "_read_thread"):
+        for attr in ("_cap_thread", "_write_thread", "_read_thread",
+                     "_preview_thread", "_nc_drain", "_nc_sup"):
             thread = getattr(self, attr, None)
             if thread is not None and not thread.is_alive():
                 setattr(self, attr, None)
         try:
+            self._enc_threads = [t for t in self._enc_threads
+                                 if t.is_alive()]
+        except (AttributeError, TypeError):
+            self._enc_threads = []
+        try:
             fps = int(self.settings.get("fps", 60))
+        except (ValueError, TypeError):
+            fps = 60
+        try:
+            was_native = bool(self._nc_active)
+        except (AttributeError, TypeError):
+            was_native = False
+        if was_native and self._native_wanted():
+            old = self._nc
+            self._nc = None
+            self._nc_active = False
+            if old is not None:
+                try:
+                    old.stop()
+                except Exception:
+                    pass
+            with self._frag_lock:
+                self._frag_deque.clear()
+                self._frag_bytes = 0
+                self._frag_rate_hist.clear()
+                self._frag_pushed_total = 0
+                self._frag_budget = self._frag_budget_bytes()
+                self._init_seg = None
+                self._init_pending = bytearray()
+                self._last_feed_wall = 0.0
+                self._feed_walls.clear()
+                self._feed_total = 0
+                self._fresh_walls.clear()
+                self._fresh_total = 0
+                self._ffmpeg_proc = None
+            with self._latest_lock:
+                self._latest_frame = None
+                self._latest_seq = 0
+            self._nc_active = True
+            try:
+                core = self._start_native_stream(fps, generation)
+            except Exception:
+                core = None
+            if core is not None:
+                self._nc_drain = threading.Thread(
+                    target=self._native_drain_loop,
+                    args=(core, generation), daemon=True)
+                self._nc_sup = threading.Thread(
+                    target=self._native_sup_loop,
+                    args=(core, fps, generation), daemon=True)
+                preview = threading.Thread(
+                    target=self._preview_loop, args=(generation,), daemon=True)
+                self._preview_thread = preview
+                self._nc_drain.start()
+                self._nc_sup.start()
+                preview.start()
+                return
+            self._nc_active = False
+            # Native relaunch failed: fall through to the Python path
+            # below (buffer is lost either way on a dead encoder).
+            # State-only resolves built no camera: force a real rebuild.
+            self._cap_output = None
+            self._cap_region = None
+            self.camera = None
+            try:
+                self._resolve_capture_target(fps)
+            except Exception:
+                pass
+        if self.camera is None and not self._nc_active:
+            # Python relaunch with no camera (e.g. flag flipped mid-run):
+            # rebuild before relaunching the encoder.
+            self._cap_output = None
+            self._cap_region = None
+            try:
+                self._resolve_capture_target(fps)
+            except Exception:
+                pass
+        try:
             proc, wall_start = self._launch_stream(fps)
         except OSError as exc:
             self.last_stream_error = "encoder relaunch failed: %s" % exc
@@ -921,6 +1828,8 @@ class Recorder:
         with self._frag_lock:
             self._frag_deque.clear()
             self._frag_bytes = 0
+            self._frag_rate_hist.clear()
+            self._frag_pushed_total = 0
             self._frag_budget = self._frag_budget_bytes()
             self._init_seg = None
             self._init_pending = bytearray()
@@ -928,22 +1837,47 @@ class Recorder:
             self._last_feed_wall = 0.0
             self._feed_walls.clear()
             self._feed_total = 0
+            self._fresh_walls.clear()
+            self._fresh_total = 0
             self._ffmpeg_proc = proc
         with self._latest_lock:
-            self._latest_jpeg = None
+            self._latest_frame = None
             self._latest_seq = 0
+            self._latest_jpeg = None
+            self._jpeg_seq = 0
+        self._enc_drops = 0
+        try:
+            while True:
+                self._enc_queue.get_nowait()
+        except Exception:
+            pass
         cap = threading.Thread(
             target=self._capture_loop, args=(fps, generation), daemon=True)
         writer = threading.Thread(
             target=self._write_loop, args=(fps, generation), daemon=True)
         read = threading.Thread(
             target=self._read_loop, args=(proc, generation), daemon=True)
+        preview = threading.Thread(
+            target=self._preview_loop, args=(generation,), daemon=True)
         self._cap_thread = cap
         self._write_thread = writer
         self._read_thread = read
+        self._preview_thread = preview
+        self._enc_threads = []
+        try:
+            tmode_c = (self._transport_mode() == "compressed")
+        except (AttributeError, TypeError):
+            tmode_c = False
+        if tmode_c:
+            for _ in range(2):
+                self._enc_threads.append(threading.Thread(
+                    target=self._encode_loop, args=(generation,), daemon=True))
         cap.start()
         writer.start()
         read.start()
+        preview.start()
+        for thread in self._enc_threads:
+            thread.start()
 
     # --------------------------------------------------------
     # SAVE CLIP (flush ring -> cache -> instant copy remux)
@@ -991,6 +1925,89 @@ class Recorder:
                 return None, None
         return frag, last_base
 
+    @staticmethod
+    def _fit_stream_offset(frag, trex, timescale, fresh_walls, fresh_total,
+                           feed_walls, feed_total, last_feed, last_base):
+        """Median-fit stream-time -> wall offset (replay + session ladder).
+
+        Each sync moof gives two wall estimates: (a) its stream timestamp
+        + unknown offset C (relatively exact: wallclock arrival stamps are
+        proven wall-paced), (b) count-walk feed wall (exact when samples
+        are 1:1 with feeds on the basis). C = median(a - b) rejects
+        outliers from duplicate-emit/skip surprises; basis (fresh vs all
+        feeds) = tighter MAD. Falls back to end-anchor when too few
+        anchors agree (notably stream tails where feeds outrun emits).
+
+        Returns (ts_offset, use_anchor, fits, moofs, total_samples) with
+        moofs = [(off, is_sync, base, count)] in stream order.
+        """
+        def _fit_basis(basis_walls, basis_total):
+            try:
+                n_walls = len(basis_walls)
+                if n_walls == 0:
+                    return None
+                base0 = basis_total - n_walls
+                diffs = []
+                running = basis_total - total_samples
+                for off, is_sync, base, count in moofs:
+                    if is_sync and base is not None:
+                        idx = running - base0
+                        if 0 <= idx < n_walls:
+                            try:
+                                diffs.append((basis_walls[idx]
+                                              - base / float(timescale),
+                                              off, base))
+                            except (TypeError, ValueError, ZeroDivisionError,
+                                    IndexError):
+                                pass
+                    running += count
+                if len(diffs) < 3:
+                    return None
+                vals = sorted(d[0] for d in diffs)
+                med = vals[len(vals) // 2]
+                mad = sorted(abs(v - med) for v in vals)[len(vals) // 2]
+                return mad, med
+            except Exception:
+                return None
+
+        try:
+            boxes, _ = _scan_fragments(frag)
+        except (TypeError, ValueError):
+            return None, True, [], [], 0
+        moofs = []
+        for typ, off, size in boxes:
+            if typ != b"moof":
+                continue
+            try:
+                is_sync, base, count = _moof_samples(frag, off, size, trex)
+            except (TypeError, ValueError):
+                continue
+            moofs.append((off, is_sync, base, count))
+        total_samples = sum(m[3] for m in moofs)
+        fits = []
+        for basis_walls, basis_total in ((fresh_walls, fresh_total),
+                                        (feed_walls, feed_total)):
+            try:
+                fit = _fit_basis(basis_walls, basis_total)
+            except Exception:
+                fit = None
+            if fit is not None:
+                fits.append(fit)
+        use_anchor = True
+        ts_offset = None
+        if fits:
+            fits.sort(key=lambda f: f[0])
+            if fits[0][0] <= 1.0:
+                use_anchor = False
+                ts_offset = fits[0][1]
+        if use_anchor:
+            if last_base is not None:
+                try:
+                    ts_offset = last_feed - last_base / float(timescale)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    ts_offset = None
+        return ts_offset, use_anchor, fits, moofs, total_samples
+
     def save_clip(self, output_path):
         """Export the current replay buffer to a clip file.
 
@@ -1008,6 +2025,8 @@ class Recorder:
             last_feed = self._last_feed_wall
             feed_walls = list(self._feed_walls)
             feed_total = self._feed_total
+            fresh_walls = list(self._fresh_walls)
+            fresh_total = self._fresh_total
             have_data = len(self._frag_deque) > 0
         if init_seg is None or not have_data:
             self.last_save_error = "buffering (no stream data yet)"
@@ -1023,45 +2042,43 @@ class Recorder:
         timescale = _video_timescale(init_seg) or 15360
         buf_sec = float(int(self.settings.get("buffer_seconds", 20)))
 
-        # Wall mapping from SAMPLE COUNTS, never stream timestamps: walk
-        # trun counts in ring order; absolute frame index of the ring's
-        # first sample = feed_total - total_samples; each moof's first
-        # sample maps to its feed wall. Immune to timestamp scheme,
-        # sparseness, unflushed tails, and eviction (feed_walls always
-        # covers the ring span: the writer ticks bound its length, and
-        # every fed frame -- duplicates included -- appends exactly one
-        # wall, so counts stay 1:1 with feeds).
-        boxes, _ = _scan_fragments(frag)
-        moofs = []  # (off, is_sync, base, count), ring order
-        for typ, off, size in boxes:
-            if typ != b"moof":
-                continue
-            is_sync, base, count = _moof_samples(frag, off, size, trex)
-            moofs.append((off, is_sync, base, count))
-        total_samples = sum(m[3] for m in moofs)
-        if total_samples <= 0 or not feed_walls:
+        # Wall mapping: fit stream-time -> wall offset over sync moofs.
+        # Shared ladder (replay + session): median-fit over feed walls
+        # with end-anchor fallback; see _fit_stream_offset.
+        (ts_offset, use_anchor, fits, moofs,
+         total_samples) = Recorder._fit_stream_offset(
+            frag, trex, timescale, fresh_walls, fresh_total,
+            feed_walls, feed_total, last_feed, last_base)
+        if total_samples <= 0:
             self.last_save_error = "no decodable fragment"
             del frag
             return False
-        first_abs = feed_total - total_samples
-        walls_base = feed_total - len(feed_walls)
 
-        def _wall_of_abs(abs_idx):
+        def _wall_of(base):
+            if base is None or ts_offset is None:
+                return None, None
             try:
-                i = int(abs_idx) - walls_base
-            except (TypeError, ValueError):
-                return None
-            if not feed_walls:
-                return None
-            return feed_walls[min(max(i, 0), len(feed_walls) - 1)]
+                return base / float(timescale) + ts_offset, None
+            except (TypeError, ValueError, ZeroDivisionError):
+                return None, None
 
-        # End = last sample of the last moof in the ring (NOT last_feed:
-        # fed-but-unflushed tail frames have no timestamps yet).
-        end_abs = first_abs + total_samples - 1
-        end_wall = _wall_of_abs(end_abs)
-        if end_wall is None:
-            end_wall = last_feed
-        end_idx = end_abs
+        boxes, _ = _scan_fragments(frag)
+        moofs = []  # (off, is_sync, base), ring order
+        for typ, off, size in boxes:
+            if typ != b"moof":
+                continue
+            is_sync, base = _moof_info(frag, off, size, trex)
+            moofs.append((off, is_sync, base))
+        if not moofs:
+            self.last_save_error = "no decodable fragment"
+            del frag
+            return False
+
+        # End = last moof in the ring (tail frames fed but unflushed have
+        # no timestamps yet; forced keys keep the tail tiny).
+        _end_wall, _end_idx = _wall_of(moofs[-1][2])
+        end_wall = _end_wall if _end_wall is not None else last_feed
+        end_idx = _end_idx
         last_base = moofs[-1][2]
 
         # Clip window: trailing buf_sec of wall time. Start at the first
@@ -1073,20 +2090,19 @@ class Recorder:
         cut_idx = None
         cut_base = None
         first_sync = None
-        running = first_abs
-        for off, is_sync, base, count in moofs:
+        for off, is_sync, base in moofs:
             if is_sync:
-                wall = _wall_of_abs(running)
+                wall, idx = _wall_of(base)
                 if first_sync is None:
-                    first_sync = (off, wall, running, base)
+                    first_sync = (off, wall, base)
                 if wall is not None and wall >= t_ideal:
-                    cut_off, cut_wall, cut_idx = off, wall, running
-                    cut_base = base
+                    cut_off, cut_wall, cut_base = off, wall, base
+                    cut_idx = idx
                     break
-            running += count
         if cut_off is None:
             if first_sync is not None:
-                cut_off, cut_wall, cut_idx, cut_base = first_sync
+                cut_off, cut_wall, cut_base = first_sync
+                cut_idx = None
             else:
                 self.last_save_error = "no decodable fragment"
                 del frag
@@ -1096,7 +2112,9 @@ class Recorder:
         if SYNC_DEBUG is not None:
             SYNC_DEBUG.update(
                 timescale=timescale, fps=fps,
-                feed_total=feed_total, n_walls=len(feed_walls),
+                last_base=last_base, cut_base=cut_base,
+                ts_offset=ts_offset, fit_used=not use_anchor,
+                fit_mad=fits[0][0] if fits else None,
                 end_idx=end_idx, cut_idx=cut_idx,
                 cut_wall=cut_wall, end_wall=end_wall,
                 wall_start=wall_start, last_feed=last_feed,
@@ -1188,57 +2206,8 @@ class Recorder:
             # rendered at exactly 48000/stereo anyway. -async 1
             # start-corrects only. No -af: it cannot coexist with
             # -filter_complex.)
-            cmd = [self._ffmpeg_path(), "-y", "-i", cache_path]
-            if sys_wav:
-                cmd.extend(["-thread_queue_size", "1024", "-i", sys_wav])
-            if mic_wav:
-                cmd.extend(["-thread_queue_size", "1024", "-i", mic_wav])
-            if sys_wav and mic_wav:
-                # NOTE: [a:0]/[a:1] pad syntax is rejected by this ffmpeg
-                # ("matches no streams"); [1:a]/[2:a] address the identical
-                # streams (sys=first audio input, mic=second). Chain and
-                # options otherwise as specified, plus normalize=0: amix
-                # defaults to attenuating the sum (measured -6 dB on a
-                # reference tone); normalize=0 preserves the previous
-                # straight-sum loudness.
-                cmd.extend(["-map", "0:v",
-                            "-filter_complex",
-                            "[1:a]aresample=48000:async=1[desktop_clean];"
-                            "[2:a]aresample=48000:async=1[mic_clean];"
-                            "[desktop_clean][mic_clean]"
-                            "amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]",
-                            "-map", "[aout]",
-                            "-c:a", "aac", "-b:a", "192k",
-                            "-ar", "48000", "-ac", "2"])
-            elif sys_wav or mic_wav:
-                cmd.extend(["-map", "0:v",
-                            "-filter_complex",
-                            "[1:a]aresample=48000:async=1[aout]",
-                            "-map", "[aout]",
-                            "-c:a", "aac", "-b:a", "192k",
-                            "-ar", "48000", "-ac", "2"])
-            else:
-                cmd.extend(["-map", "0:v"])
-            cmd.extend([
-                "-c:v", "copy",
-                "-async", "1",
-                "-avoid_negative_ts", "make_zero",
-                "-movflags", "+faststart",
-                "-t", "%.3f" % duration,
-                output_path])
-
-            completed = subprocess.run(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                timeout=120, creationflags=_NO_WINDOW)
-            if completed.returncode != 0:
-                self.last_save_error = "ffmpeg error: %s" % completed.stderr.decode(
-                    "utf-8", errors="replace")[-500:]
-                return False
-            if not (os.path.isfile(output_path)
-                    and os.path.getsize(output_path) > 0):
-                self.last_save_error = "empty output"
-                return False
-            return True
+            cmd = self._remux_cmd(cache_path, sys_wav, mic_wav)
+            return self._remux_clip(cmd, output_path, duration)
         except (OSError, RuntimeError) as exc:
             self.last_save_error = str(exc)[:300]
             return False
@@ -1249,6 +2218,651 @@ class Recorder:
                         os.remove(path)
                     except OSError:
                         pass
+
+    def _remux_cmd(self, cache_path, sys_wav, mic_wav):
+        """Build the input+map+filter+audio-codec remux command.
+
+        NOTE: [a:0]/[a:1] pad syntax is rejected by this ffmpeg
+        ("matches no streams"); [1:a]/[2:a] address the identical
+        streams (sys=first audio input, mic=second). Chain and
+        options otherwise as specified, plus normalize=0: amix
+        defaults to attenuating the sum (measured -6 dB on a
+        reference tone); normalize=0 preserves the previous
+        straight-sum loudness.
+        """
+        cmd = [self._ffmpeg_path(), "-y", "-i", cache_path]
+        if sys_wav:
+            cmd.extend(["-thread_queue_size", "1024", "-i", sys_wav])
+        if mic_wav:
+            cmd.extend(["-thread_queue_size", "1024", "-i", mic_wav])
+        if sys_wav and mic_wav:
+            cmd.extend(["-map", "0:v",
+                        "-filter_complex",
+                        "[1:a]aresample=48000:async=1[desktop_clean];"
+                        "[2:a]aresample=48000:async=1[mic_clean];"
+                        "[desktop_clean][mic_clean]"
+                        "amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]",
+                        "-map", "[aout]",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-ar", "48000", "-ac", "2"])
+        elif sys_wav or mic_wav:
+            cmd.extend(["-map", "0:v",
+                        "-filter_complex",
+                        "[1:a]aresample=48000:async=1[aout]",
+                        "-map", "[aout]",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-ar", "48000", "-ac", "2"])
+        else:
+            cmd.extend(["-map", "0:v"])
+        return cmd
+
+    def _remux_clip(self, cmd, output_path, duration, timeout=120):
+        """Run a -c:v copy remux command (shared save/session tail).
+
+        cmd is the fully built input+map+filter+audio-codec command; this
+        appends the copy/faststart/duration tail, runs ffmpeg, and
+        validates the output. Does NOT delete inputs (caller owns them).
+        """
+        cmd = list(cmd)
+        try:
+            cmd.extend([
+                "-c:v", "copy",
+                "-async", "1",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                "-t", "%.3f" % duration,
+                output_path])
+            completed = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=timeout, creationflags=_NO_WINDOW)
+            if completed.returncode != 0:
+                self.last_save_error = "ffmpeg error: %s" % completed.stderr.decode(
+                    "utf-8", errors="replace")[-500:]
+                return False
+            if not (os.path.isfile(output_path)
+                    and os.path.getsize(output_path) > 0):
+                self.last_save_error = "empty output"
+                return False
+            return True
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            self.last_save_error = str(exc)[:300]
+            return False
+
+    # --------------------------------------------------------
+    # CONTINUOUS SESSION RECORDING (tee: replay ring unaffected)
+    # --------------------------------------------------------
+    # Long-form capture alongside the rolling buffer: every ingested
+    # fragment is ALSO appended to a per-segment disk file (bounded RAM
+    # always), and every audio chunk is spilled to sidecar files. The
+    # replay ring keeps rolling independently, so F9 mid-session works.
+    # Finalize is RAM-held like save_clip (video scan + WAV renders):
+    # verified to tens of minutes; beyond that best-effort.
+    # Audio spill layout per chunk: >diii (t_start, sr, ch, nbytes) + PCM.
+
+    _SESS_AHDR = struct.Struct(">diii")
+
+    def start_continuous_recording(self, output_path):
+        """Begin a long-form session writing to output_path on stop.
+
+        Returns True. Requires the replay buffer running (the session
+        tees off its encoder). Safe to call once; second call fails.
+        """
+        try:
+            with self._sess_lock:
+                if self.is_continuous_recording:
+                    self.last_save_error = "session already recording"
+                    return False
+                if not self.recording:
+                    self.last_save_error = "start the replay buffer first"
+                    return False
+                if not output_path:
+                    self.last_save_error = "no session destination"
+                    return False
+                base = tempfile.gettempdir()
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                self._sess_dir = os.path.join(
+                    base, "killcam_session_%d_%s" % (os.getpid(), stamp))
+                os.makedirs(self._sess_dir, exist_ok=True)
+                self._sess_dest = str(output_path)
+                self._sess_seg = 0
+                self._sess_video_path = None
+                self._sess_video_fh = None
+                self._sess_video_bytes = 0
+                self._sess_broken = None
+                self._sess_spill_errors = 0
+                self._sess_audio = {}
+                self._sess_feed_walls = []
+                self._sess_fresh_walls = []
+                self._sess_feed_total = 0
+                self._sess_fresh_total = 0
+                self._sess_wall_start = time.monotonic()
+                self._sess_last_feed = 0.0
+                try:
+                    if self._init_seg:
+                        self._sess_ensure_video()
+                        self._sess_video_fh.write(bytes(self._init_seg))
+                        self._sess_video_fh.flush()
+                        self._sess_video_bytes += len(self._init_seg)
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+                self.is_continuous_recording = True
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                self.is_continuous_recording = False
+                self.last_save_error = str(exc)[:300]
+            except Exception:
+                pass
+            return False
+
+    def _sess_ensure_video(self):
+        """Open the current segment video file (caller holds _sess_lock)."""
+        if self._sess_video_fh is None:
+            if not self._sess_dir:
+                raise OSError("no session dir")
+            self._sess_video_path = os.path.join(
+                self._sess_dir, "seg%03d.mp4" % self._sess_seg)
+            self._sess_video_fh = open(self._sess_video_path, "wb")
+
+    def _sess_break(self, reason):
+        """Fail the session loud but keep partial files (caller may hold lock)."""
+        try:
+            with self._sess_lock:
+                if not self.is_continuous_recording:
+                    return
+                self.is_continuous_recording = False
+                self._sess_broken = str(reason)[:200]
+                try:
+                    if self._sess_video_fh is not None:
+                        self._sess_video_fh.flush()
+                        self._sess_video_fh.close()
+                except (OSError, ValueError):
+                    pass
+                self._sess_video_fh = None
+                for _fh, _p in list(self._sess_audio.values()):
+                    try:
+                        _fh.flush()
+                        _fh.close()
+                    except (OSError, ValueError):
+                        pass
+                self._sess_audio = {}
+        except Exception:
+            pass
+
+    def _sess_note_spill_error(self, reason):
+        """Count a spill failure; break the session after 3 consecutive.
+
+        A lone failure is usually a restart-adjacent handle race (the
+        next write lazy-opens fresh); sustained failure means the disk
+        is actually gone. Partial files are always kept.
+        """
+        try:
+            with self._sess_lock:
+                self._sess_spill_errors += 1
+                if self._sess_spill_errors >= 3:
+                    self._sess_spill_errors = 0
+                    self._sess_break("spill failed: %s" % reason)
+        except (AttributeError, TypeError):
+            pass
+
+    def _sess_write_video(self, chunk):
+        """Append one ingested block to the session file (crash-flushed).
+
+        Must NEVER raise into the reader thread (see _sess_spill_audio).
+        """
+        if not chunk:
+            return
+        try:
+            with self._sess_lock:
+                if not self.is_continuous_recording:
+                    return
+                self._sess_ensure_video()
+                self._sess_video_fh.write(chunk)
+                self._sess_video_fh.flush()
+                self._sess_video_bytes += len(chunk)
+                self._sess_spill_errors = 0
+        except Exception as exc:
+            self._sess_note_spill_error(exc)
+
+    def _sess_spill_audio(self, kind, payload, sr, ch, t_start):
+        """Append one audio chunk to its session sidecar (crash-flushed).
+
+        Must NEVER raise: audio capture threads call this inline, and a
+        telemetry failure must not kill a live audio tap.
+        """
+        if not payload:
+            return
+        try:
+            with self._sess_lock:
+                if not self.is_continuous_recording:
+                    return
+                entry = self._sess_audio.get(kind)
+                if entry is None:
+                    if not self._sess_dir:
+                        return
+                    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_",
+                                  str(kind))[:48] or "stream"
+                    path = os.path.join(
+                        self._sess_dir,
+                        "seg%03d_%s.pcm" % (self._sess_seg, safe))
+                    entry = [open(path, "wb"), path]
+                    self._sess_audio[kind] = entry
+                fh = entry[0]
+                fh.write(self._SESS_AHDR.pack(
+                    float(t_start), int(sr), int(ch), len(payload)))
+                fh.write(payload)
+                fh.flush()
+                self._sess_spill_errors = 0
+        except Exception as exc:
+            self._sess_note_spill_error(exc)
+
+    def _sess_note_feed(self, t_wall, is_fresh):
+        """Record one fed frame's wall stamp for session mapping.
+
+        Must NEVER raise into the writer thread (see _sess_spill_audio).
+        """
+        try:
+            with self._sess_lock:
+                if not self.is_continuous_recording:
+                    return
+                self._sess_feed_walls.append(t_wall)
+                self._sess_feed_total += 1
+                if is_fresh:
+                    self._sess_fresh_walls.append(t_wall)
+                    self._sess_fresh_total += 1
+                self._sess_last_feed = t_wall
+        except Exception:
+            pass
+
+    def _sess_part_path(self, dest, seg):
+        root, ext = os.path.splitext(str(dest))
+        if not ext:
+            ext = ".mp4"
+        return "%s_part%03d%s" % (root, seg + 1, ext)
+
+    def _close_session_segment(self):
+        """Snapshot the current segment for finalize; reset file state.
+
+        Returns the snapshot dict, or None when the segment holds no
+        video (nothing to finalize). Files stay on disk; cleanup happens
+        per-segment after successful finalize.
+        """
+        with self._sess_lock:
+            try:
+                if self._sess_video_fh is not None:
+                    try:
+                        self._sess_video_fh.flush()
+                        self._sess_video_fh.close()
+                    except (OSError, ValueError):
+                        pass
+                    self._sess_video_fh = None
+                for _fh, _p in list(self._sess_audio.values()):
+                    try:
+                        _fh.flush()
+                        _fh.close()
+                    except (OSError, ValueError):
+                        pass
+                audio = {k: p for k, (_f, p) in self._sess_audio.items()}
+                self._sess_audio = {}
+                snap = None
+                if self._sess_video_bytes > 0 and self._sess_video_path:
+                    snap = {
+                        "video": self._sess_video_path,
+                        "audio": audio,
+                        "feed_walls": self._sess_feed_walls,
+                        "fresh_walls": self._sess_fresh_walls,
+                        "feed_total": self._sess_feed_total,
+                        "fresh_total": self._sess_fresh_total,
+                        "wall_start": self._sess_wall_start,
+                        "last_feed": self._sess_last_feed,
+                        "seg": self._sess_seg,
+                    }
+                self._sess_video_path = None
+                self._sess_video_bytes = 0
+                self._sess_feed_walls = []
+                self._sess_fresh_walls = []
+                self._sess_feed_total = 0
+                self._sess_fresh_total = 0
+                self._sess_last_feed = 0.0
+                self._sess_wall_start = time.monotonic()
+                self._sess_seg += 1
+                return snap
+            except (AttributeError, TypeError):
+                return None
+
+    @staticmethod
+    def _sess_read_spill(path):
+        """Parse one audio sidecar back into [(bytes, sr, ch, t)] chunks."""
+        chunks = []
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return chunks
+        off, n = 0, len(data)
+        hdrlen = Recorder._SESS_AHDR.size
+        while off + hdrlen <= n:
+            try:
+                t_start, sr, ch, size = Recorder._SESS_AHDR.unpack_from(
+                    data, off)
+            except struct.error:
+                break
+            off += hdrlen
+            if size < 0 or off + size > n:
+                break
+            try:
+                chunks.append((bytes(data[off:off + size]),
+                               int(sr), int(ch), float(t_start)))
+            except (TypeError, ValueError):
+                break
+            off += size
+        del data
+        return chunks
+
+    def _finalize_session_snapshot(self, snap, dest_path):
+        """Remux one closed segment (video file + spilled audio) to dest.
+
+        End-anchored wall mapping (proven save_clip fallback): no full
+        feed-wall fit needed. RAM-held like save_clip: fine to tens of
+        minutes of footage; beyond that best-effort.
+        """
+        self.last_save_error = None
+        video = (snap or {}).get("video")
+        try:
+            if not video or not os.path.isfile(video):
+                self.last_save_error = "session segment empty"
+                return False
+            vsize = os.path.getsize(video)
+            if vsize <= 0:
+                self.last_save_error = "session segment empty"
+                return False
+            with open(video, "rb") as f:
+                head = f.read(4 * 1024 * 1024)
+            if not head:
+                self.last_save_error = "session segment empty"
+                return False
+            boxes, _ = _scan_fragments(head)
+            init_end = None
+            for typ, off, size in boxes:
+                if typ == b"moov":
+                    init_end = off + size
+                    break
+            if init_end is None:
+                self.last_save_error = "session has no init segment"
+                return False
+            init = head[:init_end]
+            trex = _trex_defaults(init)
+            timescale = _video_timescale(init) or 15360
+            last_feed = snap.get("last_feed") or time.monotonic()
+            cut_base = None
+            last_base = None
+            # Shared median-fit ladder when the segment fits the RAM-held
+            # bound (same mapping replay uses: tail stall anchors become
+            # median-rejected outliers instead of the whole story).
+            # Beyond the bound, end-anchor only (documented degradation).
+            FIT_READ_MAX = 1536 * 1024 * 1024
+            if vsize <= FIT_READ_MAX:
+                with open(video, "rb") as f:
+                    data = f.read()
+                if not data:
+                    self.last_save_error = "session segment empty"
+                    return False
+                (ts_offset, _use_anchor, _fits, moofs,
+                 _total) = Recorder._fit_stream_offset(
+                    data, trex, timescale,
+                    list(snap.get("fresh_walls") or []),
+                    snap.get("fresh_total") or 0,
+                    list(snap.get("feed_walls") or []),
+                    snap.get("feed_total") or 0,
+                    last_feed, None)
+                del head
+                if ts_offset is None:
+                    for _o, _s, b, _c in moofs:
+                        if b is not None:
+                            last_base = b
+                    if last_base is None:
+                        self.last_save_error = "session tail undecodable"
+                        return False
+                    try:
+                        ts_offset = (last_feed
+                                     - last_base / float(timescale))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        self.last_save_error = "session clock mapping failed"
+                        return False
+                first = None
+                for _o, is_sync, b, _c in moofs:
+                    if is_sync and b is not None:
+                        first = b
+                        break
+                if first is None:
+                    self.last_save_error = "session has no keyframe"
+                    return False
+                cut_base = first
+                if last_base is None:
+                    for _o, _s, b, _c in moofs:
+                        if b is not None:
+                            last_base = b
+                try:
+                    cut_wall = cut_base / float(timescale) + ts_offset
+                except (TypeError, ValueError, ZeroDivisionError):
+                    self.last_save_error = "session clock mapping failed"
+                    return False
+                end_wall = last_feed
+                for _o, _s, b, _c in reversed(moofs):
+                    if b is not None:
+                        try:
+                            end_wall = b / float(timescale) + ts_offset
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            pass
+                        break
+                del data
+            else:
+                # First sync moof at/after init (scan forward if needed).
+                first = self._sess_first_sync(video, init_end, trex)
+                if first is None:
+                    self.last_save_error = "session has no keyframe"
+                    return False
+                cut_off, cut_base = first
+                # Last moof base from the tail (closed file: complete).
+                with open(video, "rb") as f:
+                    try:
+                        f.seek(max(0, vsize - 8 * 1024 * 1024))
+                        tail = f.read()
+                    except OSError:
+                        tail = b""
+                last_base = None
+                if tail:
+                    tboxes, _ = _scan_fragments(tail)
+                    for typ, off, size in tboxes:
+                        if typ != b"moof":
+                            continue
+                        try:
+                            _sync, base = _moof_info(tail, off, size, trex)
+                        except (TypeError, ValueError):
+                            continue
+                        if base is not None:
+                            last_base = base
+                if last_base is None:
+                    self.last_save_error = "session tail undecodable"
+                    return False
+                try:
+                    ts_offset = last_feed - last_base / float(timescale)
+                    cut_wall = cut_base / float(timescale) + ts_offset
+                except (TypeError, ValueError, ZeroDivisionError):
+                    self.last_save_error = "session clock mapping failed"
+                    return False
+                end_wall = last_feed
+                del head, tail
+            duration = end_wall - cut_wall
+            if duration < 0.5:
+                self.last_save_error = "session too short"
+                return False
+            try:
+                vid_span = (last_base - cut_base) / float(timescale)
+            except (TypeError, ValueError, ZeroDivisionError):
+                vid_span = 0.0
+            if vid_span > 0.5 and vid_span < duration - 0.25:
+                duration = max(0.5, vid_span)
+
+            # Audio: rebuild chunk lists from sidecars, same gates as replay.
+            mic_chunks, sys_chunks, app_bufs = [], [], []
+            for kind, path in (snap.get("audio") or {}).items():
+                chunks = self._sess_read_spill(path)
+                if not chunks:
+                    continue
+                if kind == "mic":
+                    mic_chunks = chunks
+                elif kind == "sys":
+                    sys_chunks = chunks
+                elif kind.startswith("app_"):
+                    app_bufs.append(chunks)
+            has_mic = mic_chunks and self._buffer_has_audio(mic_chunks)
+            has_sys = sys_chunks and self._buffer_has_audio(sys_chunks)
+            if has_mic and not Recorder._stream_is_fresh(mic_chunks, cut_wall):
+                has_mic = False
+            if has_sys and not Recorder._stream_is_fresh(sys_chunks, cut_wall):
+                has_sys = False
+            desktop_parts = []
+            if has_sys:
+                desktop_parts.append(sys_chunks)
+            for abuf in app_bufs:
+                if (abuf and self._buffer_has_audio(abuf)
+                        and Recorder._stream_is_fresh(abuf, cut_wall)):
+                    desktop_parts.append(abuf)
+            os.makedirs(os.path.dirname(os.path.abspath(dest_path)),
+                        exist_ok=True)
+            temp_files = []
+            try:
+                sys_wav = mic_wav = None
+                if desktop_parts:
+                    sys_wav = tempfile.mktemp(suffix=".wav")
+                    temp_files.append(sys_wav)
+                    if not self._render_desktop_wav(
+                            desktop_parts, sys_wav, cut_wall, duration):
+                        sys_wav = None
+                        temp_files.remove(sys_wav)
+                if has_mic:
+                    mic_wav = tempfile.mktemp(suffix=".wav")
+                    temp_files.append(mic_wav)
+                    if not self._render_stream_wav(
+                            mic_chunks, mic_wav, cut_wall, duration):
+                        mic_wav = None
+                        temp_files.remove(mic_wav)
+                del mic_chunks, sys_chunks, app_bufs, desktop_parts
+                timeout = min(3600, max(180, duration * 1.5 + 120))
+                ok = self._remux_clip(
+                    self._remux_cmd(video, sys_wav, mic_wav),
+                    dest_path, duration, timeout=timeout)
+            finally:
+                for path in temp_files:
+                    if path and os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+            if ok:
+                try:
+                    os.remove(video)
+                except OSError:
+                    pass
+                for path in (snap.get("audio") or {}).values():
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            return ok
+        except (OSError, RuntimeError, ValueError, TypeError) as exc:
+            self.last_save_error = str(exc)[:300]
+            return False
+
+    @staticmethod
+    def _sess_first_sync(video_path, start_off, trex):
+        """(file_offset, base) of the first sync moof at/after start_off."""
+        try:
+            scanned = 0
+            with open(video_path, "rb") as f:
+                f.seek(start_off)
+                while scanned < 64 * 1024 * 1024:
+                    data = f.read(4 * 1024 * 1024)
+                    if not data:
+                        return None
+                    boxes, _ = _scan_fragments(data)
+                    for typ, off, size in boxes:
+                        if typ != b"moof":
+                            continue
+                        try:
+                            is_sync, base, _count = _moof_samples(
+                                data, off, size, trex)
+                        except (TypeError, ValueError):
+                            continue
+                        if is_sync and base is not None:
+                            return start_off + scanned + off, base
+                    scanned += len(data)
+        except OSError:
+            pass
+        return None
+
+    def _sess_finalize_bg(self, snap, dest_path):
+        """Background segment finalize (restart path): never raises."""
+        try:
+            ok = self._finalize_session_snapshot(snap, dest_path)
+            if not ok and not self.last_save_error:
+                self.last_save_error = "background segment finalize failed"
+            elif ok:
+                try:
+                    d = self._sess_dir
+                    if d and os.path.isdir(d) and not os.listdir(d):
+                        os.rmdir(d)
+                except OSError:
+                    pass
+        except Exception as exc:
+            try:
+                self.last_save_error = str(exc)[:300]
+            except Exception:
+                pass
+
+    def stop_continuous_recording(self):
+        """Close the session and finalize every segment synchronously.
+
+        Single segment (no restarts) lands exactly on the requested path;
+        otherwise segments land as <stem>_partNNN.mp4. Returns True only
+        when every segment finalized; scratch is cleaned per success.
+        """
+        with self._sess_lock:
+            active = bool(self.is_continuous_recording)
+            dest = self._sess_dest
+            closed = int(self._sess_seg)
+            self.is_continuous_recording = False
+        if not active or not dest:
+            self.last_save_error = "no active session"
+            return False
+        snap = self._close_session_segment()
+        if snap is None and closed == 0:
+            self.last_save_error = "session too short"
+            self._sess_cleanup_dir()
+            return False
+        ok_all = True
+        if snap is not None:
+            dest_path = dest if closed == 0 else self._sess_part_path(
+                dest, closed)
+            if not self._finalize_session_snapshot(snap, dest_path):
+                ok_all = False
+        self._sess_cleanup_dir()
+        if self._sess_broken:
+            try:
+                self.last_save_info = "session spill issue: %s" % self._sess_broken
+            except (AttributeError, TypeError):
+                pass
+        return ok_all
+
+    def _sess_cleanup_dir(self):
+        try:
+            d = self._sess_dir
+            self._sess_dir = None
+            if d and os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
+        except (OSError, TypeError, AttributeError):
+            pass
 
     # --------------------------------------------------------
     # ENABLE TOGGLES
@@ -1355,10 +2969,14 @@ class Recorder:
         fps = int(self.settings.get("fps", 60))
         # Smoke-test encoder flags (re-validated when fps changes, since
         # bitrate caps scale with fps)
+        use_gpu = self._use_gpu()
         if (self._live_encoder is None or self._live_fps != fps
-                or self._active_profile != self._compression_profile()):
+                or self._active_profile != self._compression_profile()
+                or getattr(self, "_live_use_gpu", None) != use_gpu
+                or getattr(self, "_live_transport", None) != self._transport_mode()):
             self._live_encoder = None
             self._active_profile = self._compression_profile()
+            self._live_use_gpu = use_gpu
             self._ensure_live_args(fps)
             self._live_fps = fps
 
@@ -1368,6 +2986,8 @@ class Recorder:
         with self._frag_lock:
             self._frag_deque = collections.deque()
             self._frag_bytes = 0
+            self._frag_rate_hist = collections.deque()
+            self._frag_pushed_total = 0
             self._frag_budget = self._frag_budget_bytes()
             self._init_seg = None
             self._init_pending = bytearray()
@@ -1390,33 +3010,121 @@ class Recorder:
         with self._frag_lock:
             self._feed_walls = collections.deque(maxlen=wall_cap)
             self._feed_total = 0
-
+            self._fresh_walls = collections.deque(maxlen=wall_cap)
+            self._fresh_total = 0
+        with self._latest_lock:
+            self._latest_frame = None
+            self._latest_seq = 0
+            self._latest_jpeg = None
+            self._jpeg_seq = 0
+        self._enc_drops = 0
         try:
-            # Small dxcam buffer: we consume every slot, so a deep queue
-            # only wastes RAM (~6 MB/frame at 1080p, 64 deep = ~400 MB).
-            # One retry on output 0: a stale saved index must never leave
-            # the app booted with recording off.
-            try:
-                self.camera = dxcam.create(output_idx=self.monitor_index, output_color="BGR",
-                                           max_buffer_len=8)
-            except Exception:
-                if self.monitor_index != 0:
-                    self.monitor_index = 0
-                    try:
-                        self.settings["monitor_index"] = 0
-                    except (TypeError, AttributeError):
-                        pass
-                    self.camera = dxcam.create(output_idx=0, output_color="BGR",
-                                               max_buffer_len=8)
-                else:
-                    raise
-            self.camera.start(target_fps=fps)
+            while True:
+                self._enc_queue.get_nowait()
+        except Exception:
+            pass
+        # Fresh boot: no session can survive across start(); close any
+        # leaked handles defensively (normally already finalized).
+        try:
+            self.is_continuous_recording = False
+            if self._sess_video_fh is not None:
+                try:
+                    self._sess_video_fh.close()
+                except (OSError, ValueError):
+                    pass
+                self._sess_video_fh = None
+            for _fh, _p in list(self._sess_audio.values()):
+                try:
+                    _fh.close()
+                except (OSError, ValueError):
+                    pass
+            self._sess_audio = {}
+            self._sess_dir = None
+            self._sess_dest = None
+        except (AttributeError, TypeError):
+            pass
+
+        # Resolve the configured source FIRST so window/pinned modes
+        # start on the right output (the stream geometry below must
+        # match the camera or the pipe corrupts). Under the native core
+        # the target resolve is state-only (no dxcam camera is built).
+        self._cap_output = None
+        self._cap_region = None
+        try:
+            want_native = bool(self._native_wanted())
+        except (AttributeError, TypeError):
+            want_native = False
+        if want_native:
+            self._nc = None
+            self._nc_active = True
+            self.camera = None
+        try:
+            self._resolve_capture_target(fps)
         except Exception as exc:
             self.recording = False
             self.camera = None
+            if want_native:
+                self._nc_active = False
             raise RuntimeError(f"Could not start screen capture: {exc}") from exc
+        if want_native:
+            if self._cap_output is None:
+                self.recording = False
+                self._nc_active = False
+                raise RuntimeError("Could not start screen capture: no output")
+        elif self.camera is None:
+            self.recording = False
+            raise RuntimeError("Could not start screen capture: no output")
+        try:
+            mon_idx = max(0, int(self.settings.get("monitor_index", 0)))
+        except (ValueError, TypeError):
+            mon_idx = 0
+        try:
+            if (str(self.settings.get("capture_source", "monitor")).lower()
+                    == "monitor" and self._cap_output == 0 and mon_idx != 0):
+                self.monitor_index = 0
+                self.settings["monitor_index"] = 0
+        except (AttributeError, TypeError, ValueError):
+            pass
 
         try:
+            native_core = None
+            if want_native:
+                try:
+                    native_core = self._start_native_stream(fps, generation)
+                except Exception:
+                    native_core = None
+            if native_core is not None:
+                with self._frag_lock:
+                    self._last_feed_wall = 0.0
+                    self._ffmpeg_proc = None
+                self._cap_thread = None
+                self._write_thread = None
+                self._read_thread = None
+                self._nc_drain = threading.Thread(
+                    target=self._native_drain_loop,
+                    args=(native_core, generation), daemon=True)
+                self._nc_sup = threading.Thread(
+                    target=self._native_sup_loop,
+                    args=(native_core, fps, generation), daemon=True)
+                self._preview_thread = threading.Thread(
+                    target=self._preview_loop, args=(generation,), daemon=True)
+                self._nc_drain.start()
+                self._nc_sup.start()
+                self._preview_thread.start()
+                self._start_audio_capture()
+                return
+            self._nc_active = False
+            self._nc = None
+            # State-only resolve built no camera: force a real dxcam build.
+            self._cap_output = None
+            self._cap_region = None
+            try:
+                self._resolve_capture_target(fps)
+            except Exception:
+                pass
+            if self.camera is None:
+                self.recording = False
+                raise RuntimeError("Could not start screen capture: no output")
             proc, wall_start = self._launch_stream(fps)
         except OSError as exc:
             self.recording = False
@@ -1435,17 +3143,376 @@ class Recorder:
             target=self._write_loop, args=(fps, generation), daemon=True)
         self._read_thread = threading.Thread(
             target=self._read_loop, args=(proc, generation), daemon=True)
+        self._preview_thread = threading.Thread(
+            target=self._preview_loop, args=(generation,), daemon=True)
+        self._enc_threads = []
+        if self._transport_mode() == "compressed":
+            for _ in range(2):
+                self._enc_threads.append(threading.Thread(
+                    target=self._encode_loop, args=(generation,), daemon=True))
         self._cap_thread.start()
         self._write_thread.start()
         self._read_thread.start()
+        self._preview_thread.start()
+        for thread in self._enc_threads:
+            thread.start()
         self._start_audio_capture()
 
-    def _restart_camera(self):
-        """Recreate the screen capture on the current monitor_index.
+    def _dxcam_output_map(self):
+        """Map dxcam output_idx -> screeninfo geometry.
 
-        The encoder keeps running (writer repeats the last JPEG across
-        the gap), so the stream and buffer survive a monitor switch.
+        screeninfo and dxcam enumerate in DIFFERENT orders (verified:
+        screeninfo lists the 1200p panel first, dxcam puts the 1080p
+        primary at Output[0]), so align by (resolution, primary flag),
+        not position. Cached; rebuilt when the display count changes.
+        Returns {idx: (x, y, w, h)} (origins from screeninfo).
         """
+        try:
+            import re
+            mons = list(get_monitors()) if _HAVE_SCREENINFO else []
+        except Exception:
+            mons = []
+        try:
+            import dxcam as _dxcam
+            info = str(_dxcam.output_info())
+            outs = []
+            for line in info.splitlines():
+                m = re.search(
+                    r"Output\[(\d+)\].*?Res:\((\d+)\s*,\s*(\d+)\).*?"
+                    r"Primary:(True|False)", line)
+                if m:
+                    outs.append((int(m.group(1)), int(m.group(2)),
+                                 int(m.group(3)), m.group(4) == "True"))
+        except Exception:
+            outs = []
+        mapping = {}
+        used = set()
+        for mon in mons:
+            try:
+                mw, mh = int(mon.width), int(mon.height)
+                prim = bool(getattr(mon, "is_primary", False))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            for idx, ow, oh, oprim in outs:
+                if idx in used:
+                    continue
+                if ow == mw and oh == mh and oprim == prim:
+                    try:
+                        mapping[idx] = (int(mon.x), int(mon.y), mw, mh)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    used.add(idx)
+                    break
+        try:
+            if (self._output_map is None
+                    or set(self._output_map) != set(mapping)
+                    or len(mapping) != len(mons)):
+                self._output_map = mapping
+        except (AttributeError, TypeError):
+            pass
+        return mapping or (self._output_map or {})
+
+    def _foreground_target(self):
+        """Active-window capture target, or None to keep the current one.
+
+        Returns (output_idx, region, key, label): key is a stable process
+        id for switch detection (titles change constantly), label is the
+        friendly name for the preview. Skips our own windows,
+        minimized/zero-area windows, and shells with no identity.
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return None
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            try:
+                own = int(pid.value) == os.getpid()
+            except (TypeError, ValueError):
+                own = False
+            if own:
+                return None  # ours (app, popup, dialog): keep target
+            try:
+                if user32.IsIconic(hwnd):
+                    return None  # minimized: keep target
+            except (AttributeError, OSError):
+                pass
+            rect = wintypes.RECT()
+            try:
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return None
+            except (AttributeError, OSError):
+                return None
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            if w < 64 or h < 64:
+                return None
+            key = ""
+            try:
+                import psutil
+                key = str(psutil.Process(int(pid.value)).name() or "")
+            except Exception:
+                key = ""
+            try:
+                n = user32.GetWindowTextLengthW(hwnd)
+                title = ""
+                if n > 0:
+                    buf = ctypes.create_unicode_buffer(min(n + 1, 128))
+                    user32.GetWindowTextW(hwnd, buf, min(n + 1, 128))
+                    title = buf.value or ""
+            except (AttributeError, OSError, ValueError):
+                title = ""
+            label = title.strip() or key
+            if not key:
+                key = label
+            if not key:
+                return None
+            if len(label) > 40:
+                label = label[:37] + "..."
+            cx, cy = rect.left + w // 2, rect.top + h // 2
+            mapping = self._dxcam_output_map()
+            out_idx, origin = None, (0, 0)
+            for idx, (ox, oy, ow, oh) in mapping.items():
+                if ox <= cx < ox + ow and oy <= cy < oy + oh:
+                    out_idx, origin = idx, (ox, oy)
+                    break
+            if out_idx is None:
+                return None
+            ox, oy = origin
+            region = (max(0, rect.left - ox), max(0, rect.top - oy),
+                      rect.right - ox, rect.bottom - oy)
+            return out_idx, region, key, label
+        except Exception:
+            return None
+
+    def _pinned_target(self):
+        """Pinned-window target: largest visible window of the pinned exe.
+
+        Returns (output_idx, region, key, label) like _foreground_target,
+        or None to keep the current target (app closed/minimized). Unlike
+        active-follow, the window need not be foreground -- but it must
+        stay unminimized and uncovered (region crops the display).
+        """
+        try:
+            want = str(self.settings.get("capture_window", "") or "")
+        except (AttributeError, TypeError):
+            want = ""
+        want = want.strip().lower()
+        if not want:
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            best = None  # (area, hwnd, rect)
+            cands = []
+
+            CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND,
+                                    wintypes.LPARAM)
+
+            def cb(hwnd, _):
+                try:
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    if user32.IsIconic(hwnd):
+                        return True
+                    pid = ctypes.c_ulong()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    try:
+                        if int(pid.value) == os.getpid():
+                            return True  # ours: never
+                    except (TypeError, ValueError):
+                        pass
+                    rect = wintypes.RECT()
+                    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        return True
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w < 64 or h < 64:
+                        return True
+                    cands.append((w * h, hwnd,
+                                  (rect.left, rect.top, rect.right,
+                                   rect.bottom), int(pid.value)))
+                except Exception:
+                    pass
+                return True
+
+            user32.EnumWindows(CB(cb), 0)
+            try:
+                import psutil
+                for area, hwnd, rect, pid in sorted(
+                        cands, key=lambda c: -c[0]):
+                    try:
+                        if str(psutil.Process(pid).name() or "").lower() != want:
+                            continue
+                    except Exception:
+                        continue
+                    best = (area, hwnd, rect, pid)
+                    break
+            except ImportError:
+                return None
+            if best is None:
+                return None
+            _, hwnd, (l, t, r, b), pid = best
+            w, h = r - l, b - t
+            try:
+                n = user32.GetWindowTextLengthW(hwnd)
+                title = ""
+                if n > 0:
+                    buf = ctypes.create_unicode_buffer(min(n + 1, 128))
+                    user32.GetWindowTextW(hwnd, buf, min(n + 1, 128))
+                    title = buf.value or ""
+            except (AttributeError, OSError, ValueError):
+                title = ""
+            label = (title.strip() or want) + " (pinned)"
+            if len(label) > 40:
+                label = label[:30] + "... (pinned)"
+            mapping = self._dxcam_output_map()
+            out_idx, origin = None, (0, 0)
+            for idx, (ox, oy, ow, oh) in mapping.items():
+                if ox <= l + w // 2 < ox + ow and oy <= t + h // 2 < oy + oh:
+                    out_idx, origin = idx, (ox, oy)
+                    break
+            if out_idx is None:
+                return None
+            ox, oy = origin
+            region = (max(0, l - ox), max(0, t - oy), r - ox, b - oy)
+            return out_idx, region, "pin:" + want, label
+        except Exception:
+            return None
+
+    def _resolve_capture_target(self, fps):
+        """Point the camera at the configured source (called ~1 Hz).
+
+        Monitor pins (monitor_index, full output); active follows the
+        foreground window; pinned tracks a chosen exe wherever it is
+        (foreground or not -- but it must stay unminimized and visible:
+        covering it records the cover). Rebuilds the camera only on
+        change; the writer's min-cadence replay bridges the gap either
+        way.
+        """
+        try:
+            want_source = str(self.settings.get("capture_source",
+                                                "monitor")).lower()
+        except (AttributeError, TypeError):
+            want_source = "monitor"
+        if want_source == "pinned":
+            try:
+                want_exe = str(self.settings.get("capture_window", "") or "")
+            except (AttributeError, TypeError):
+                want_exe = ""
+            tgt = self._pinned_target()
+            if tgt is None:
+                # Nothing to switch to (app closed or never chosen): hold
+                # the current target but say so on the label instead of
+                # silently keeping a stale window.
+                try:
+                    self._cap_label = ("Pinned: choose an app" if not want_exe.strip()
+                                       else "Pinned: %s (not found)" % want_exe.strip()[:24])
+                except (AttributeError, TypeError):
+                    pass
+                return
+            out_idx, region, key, label = tgt
+        elif want_source == "active":
+            tgt = self._foreground_target()
+            if tgt is None:
+                return  # keep current target (transient/ours/minimized)
+            out_idx, region, key, label = tgt
+        else:
+            try:
+                out_idx = max(0, int(self.settings.get("monitor_index", 0)))
+            except (ValueError, TypeError):
+                out_idx = 0
+            region, key, label = None, None, None
+        try:
+            same_out = (out_idx == self._cap_output)
+            same_key = (key is None or key == self._cap_key)
+        except (AttributeError, TypeError):
+            same_out, same_key = False, False
+        try:
+            geom_now = None
+            g = (self._dxcam_output_map() or {}).get(out_idx)
+            if g is not None:
+                geom_now = (int(g[2]), int(g[3]))
+        except (AttributeError, TypeError, ValueError):
+            geom_now = None
+        try:
+            geom_changed = (geom_now is not None
+                            and self._stream_geom is not None
+                            and tuple(geom_now) != tuple(self._stream_geom))
+        except (AttributeError, TypeError, ValueError):
+            geom_changed = False
+        if same_out and same_key and not geom_changed:
+            if region is None or self._cap_region is None:
+                if region == self._cap_region:
+                    return
+            else:
+                try:
+                    drift = max(abs(a - b) for a, b in zip(
+                        [int(v) for v in region],
+                        [int(v) for v in self._cap_region]))
+                except (TypeError, ValueError, AttributeError):
+                    drift = 999
+                if drift <= 12:
+                    # Same window, tiny move: adopt the rect without the
+                    # restart churn (crop lags <1 s while dragging).
+                    try:
+                        self._cap_region = tuple(int(v) for v in region)
+                    except (TypeError, ValueError):
+                        pass
+                    return
+        try:
+            self._rebuild_camera(out_idx, region, label, fps)
+        except Exception:
+            pass
+        try:
+            self._cap_key = key
+        except (AttributeError, TypeError):
+            pass
+        if geom_changed and self.recording:
+            # Display mode changed mid-run: raw pipe geometry no longer
+            # matches. Relaunch the stream (loses the buffer, rare).
+            # Compressed pipe is pre-sized to the target, so monitor
+            # geometry never affects it: no relaunch needed.
+            try:
+                tmode_c = (self._transport_mode() == "compressed")
+            except (AttributeError, TypeError):
+                tmode_c = False
+            if not tmode_c:
+                try:
+                    self._restart_stream("display geometry changed")
+                except Exception:
+                    pass
+
+    def _rebuild_camera(self, output_idx, region, label, fps):
+        """(Re)create dxcam on an output + region (region None = full).
+
+        Falls back to output 0 on failure. Keeps _cap_* state + label.
+        Under the native core, duplication is native-owned: track the
+        state only (the sup loop reconfigures the core itself).
+        """
+        try:
+            output_idx = max(0, int(output_idx))
+        except (ValueError, TypeError):
+            output_idx = 0
+        try:
+            if bool(self._nc_active):
+                self._cap_output = output_idx
+                self._cap_region = region
+                try:
+                    if label:
+                        self._cap_label = str(label)
+                    elif region is None:
+                        self._cap_label = "Monitor %d" % (output_idx + 1)
+                    else:
+                        self._cap_label = "Monitor %d (region)" % (output_idx + 1)
+                except (TypeError, ValueError):
+                    pass
+                return
+        except (AttributeError, TypeError):
+            pass
         cam = self.camera
         self.camera = None
         if cam is not None:
@@ -1453,29 +3520,113 @@ class Recorder:
                 cam.stop()
             except Exception:
                 pass
-        fps = int(self.settings.get("fps", 60))
         try:
-            self.camera = dxcam.create(output_idx=self.monitor_index,
-                                       output_color="BGR", max_buffer_len=8)
-        except Exception:
-            if self.monitor_index != 0:
-                self.monitor_index = 0
+            fps_i = int(fps)
+        except (ValueError, TypeError):
+            fps_i = 60
+        try:
+            self.camera = dxcam.create(output_idx=output_idx,
+                                       output_color="BGR", max_buffer_len=4)
+            if region is not None:
                 try:
-                    self.settings["monitor_index"] = 0
-                except (TypeError, AttributeError):
+                    self.camera.region = tuple(int(v) for v in region)
+                except (TypeError, ValueError, AttributeError):
                     pass
+            self.camera.start(target_fps=min(fps_i * 2, 360))
+        except Exception:
+            if output_idx != 0:
                 self.camera = dxcam.create(output_idx=0,
                                            output_color="BGR",
-                                           max_buffer_len=8)
+                                           max_buffer_len=4)
+                output_idx = 0
+                region = None
+                self.camera.start(target_fps=min(fps_i * 2, 360))
             else:
                 raise
-        self.camera.start(target_fps=fps)
+        self._cap_output = output_idx
+        self._cap_region = region
+        try:
+            geom = (self._dxcam_output_map() or {}).get(output_idx)
+            self._pad_wh = (int(geom[2]), int(geom[3])) if geom else None
+        except (AttributeError, TypeError, ValueError):
+            self._pad_wh = None
+        try:
+            if label:
+                self._cap_label = str(label)
+            elif region is None:
+                self._cap_label = "Monitor %d" % (output_idx + 1)
+            else:
+                self._cap_label = "Monitor %d (region)" % (output_idx + 1)
+        except (TypeError, ValueError):
+            pass
+
+    def _restart_camera(self):
+        """Recreate the screen capture on the current monitor_index.
+
+        The encoder keeps running (writer repeats the last JPEG across
+        the gap), so the stream and buffer survive a monitor switch.
+        """
+        try:
+            fps = int(self.settings.get("fps", 60))
+        except (ValueError, TypeError):
+            fps = 60
+        try:
+            mon_idx = max(0, int(self.settings.get("monitor_index", 0)))
+        except (ValueError, TypeError):
+            mon_idx = 0
+        self._rebuild_camera(mon_idx, None, None, fps)
+        try:
+            if self._cap_output == 0 and mon_idx != 0:
+                self.monitor_index = 0
+                self.settings["monitor_index"] = 0
+        except (AttributeError, TypeError, ValueError):
+            pass
 
     def stop(self):
         if not self.recording:
             return
 
         self.recording = False
+        # An active session finalizes here (files only: no live streams
+        # needed), synchronously so nothing is lost on quit. The stop
+        # call below flips the session flag first, cutting off new spill
+        # writes before teardown joins the threads further down.
+        try:
+            if bool(self.is_continuous_recording):
+                try:
+                    self.stop_continuous_recording()
+                except Exception:
+                    pass
+        except (AttributeError, TypeError):
+            pass
+        try:
+            native = bool(self._nc_active)
+        except (AttributeError, TypeError):
+            native = False
+        if native:
+            core = self._nc
+            self._nc = None
+            self._nc_active = False
+            if core is not None:
+                try:
+                    core.stop()
+                except Exception:
+                    pass
+            for thread in (self._nc_drain, self._nc_sup,
+                           self._preview_thread):
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=5)
+            self._nc_drain = None
+            self._nc_sup = None
+            self._cap_thread = None
+            self._write_thread = None
+            self._read_thread = None
+            self._preview_thread = None
+            self._ffmpeg_proc = None
+            self._stop_audio_capture()
+            self._stop_app_captures()
+            self.camera = None
+            return
         proc = self._ffmpeg_proc
         # Closing stdin lets ffmpeg finalize the stream and exit cleanly
         if proc is not None:
@@ -1484,12 +3635,15 @@ class Recorder:
             except (OSError, ValueError):
                 pass
         for thread in (self._cap_thread, self._write_thread,
-                       self._read_thread):
+                       self._read_thread, self._preview_thread,
+                       *self._enc_threads):
             if thread is not None and thread.is_alive():
                 thread.join(timeout=5)
         self._cap_thread = None
         self._write_thread = None
         self._read_thread = None
+        self._preview_thread = None
+        self._enc_threads = []
         self._teardown_proc(proc)
         self._ffmpeg_proc = None
 
@@ -1582,13 +3736,65 @@ class Recorder:
                 vol = self.system_volume / 100.0
                 if vol < 1.0:
                     pcm = (pcm.astype(np.float64) * vol).astype(np.int16)
-                # Timestamp = start of this chunk (arrival minus chunk duration)
+                # Timestamp = device time of the chunk start: arrival minus
+                # the chunk itself MINUS whatever was still buffered ahead
+                # of it. Backlog depth varies with load (deep when busy),
+                # so a fixed constant under-corrects exactly when it
+                # matters; measuring per chunk self-calibrates. Falls back
+                # to arrival-minus-duration when unreadable.
                 arrival = time.monotonic()
-                t_start = arrival - (pcm.size // max(1, ch)) / float(sr)
+                try:
+                    backlog = max(0, int(stream.get_read_available()))
+                except Exception:
+                    backlog = -1
+                # Clamp: backlog is bounded by the device buffer in any
+                # sane implementation; absurd values mean the API reports
+                # cumulative/foreign units, and subtracting them would
+                # place audio seconds early. 2x frames_per_buffer caps
+                # damage while never binding legitimate depths.
+                try:
+                    backlog_cap = 2 * int(chunk * 2)
+                except (TypeError, ValueError):
+                    backlog_cap = 19200
+                if backlog < 0 or backlog > backlog_cap:
+                    if backlog > backlog_cap:
+                        try:
+                            self._log_audio_error(
+                                "loopback backlog implausible: %d" % backlog)
+                        except Exception:
+                            pass
+                    backlog = 0
+                try:
+                    import collections as _collections
+                    _bl = getattr(Recorder, "_backlog_dbg", None)
+                    if _bl is None:
+                        Recorder._backlog_dbg = _bl = _collections.deque(maxlen=500)
+                    _bl.append(backlog)
+                except Exception:
+                    pass
+                if backlog < 0:
+                    backlog = 0
+                t_start = (arrival - (Recorder._BACKLOG_FACTOR * backlog
+                                       + pcm.size // max(1, ch))
+                           / float(sr))
                 if self._sys_start_time == 0.0:
                     self._sys_start_time = arrival
                 audio_replay.append((pcm.tobytes(), sr, ch, t_start))
-                level = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2)))
+                try:
+                    if self.is_continuous_recording:
+                        self._sess_spill_audio(
+                            "sys", pcm.tobytes(), sr, ch, t_start)
+                except Exception:
+                    pass
+                # Peak level for the UI bars: single-pass max/min, no
+                # float conversion (RMS costed measurable CPU across
+                # three capture threads for a display-only number).
+                try:
+                    _mx = int(pcm.max())
+                    _mn = int(pcm.min())
+                except (ValueError, TypeError):
+                    _mx, _mn = 0, 0
+                level = float(_mx if _mx >= -_mn else -_mn)
                 self.system_audio_buffer.append(level)
                 del pcm, data
         except Exception as exc:
@@ -1638,13 +3844,61 @@ class Recorder:
                 vol = self.mic_volume / 100.0
                 if vol < 1.0:
                     pcm = (pcm.astype(np.float64) * vol).astype(np.int16)
-                # Timestamp = start of this chunk (arrival minus chunk duration)
+                # Timestamp = device time of the chunk start: arrival minus
+                # the chunk itself MINUS whatever was still buffered ahead
+                # of it (see system loop: fixed constants under-correct
+                # under load; per-chunk measurement self-calibrates).
                 arrival = time.monotonic()
-                t_start = arrival - (pcm.size // max(1, ch)) / float(sr)
+                try:
+                    backlog = max(0, int(stream.get_read_available()))
+                except Exception:
+                    backlog = -1
+                # Clamp: backlog is bounded by the device buffer in any
+                # sane implementation; absurd values mean the API reports
+                # cumulative/foreign units, and subtracting them would
+                # place audio seconds early. 2x frames_per_buffer caps
+                # damage while never binding legitimate depths.
+                try:
+                    backlog_cap = 2 * int(chunk * 2)
+                except (TypeError, ValueError):
+                    backlog_cap = 19200
+                if backlog < 0 or backlog > backlog_cap:
+                    if backlog > backlog_cap:
+                        try:
+                            self._log_audio_error(
+                                "loopback backlog implausible: %d" % backlog)
+                        except Exception:
+                            pass
+                    backlog = 0
+                try:
+                    import collections as _collections
+                    _bl = getattr(Recorder, "_backlog_dbg", None)
+                    if _bl is None:
+                        Recorder._backlog_dbg = _bl = _collections.deque(maxlen=500)
+                    _bl.append(backlog)
+                except Exception:
+                    pass
+                if backlog < 0:
+                    backlog = 0
+                t_start = (arrival - (Recorder._BACKLOG_FACTOR * backlog
+                                       + pcm.size // max(1, ch))
+                           / float(sr))
                 if self._mic_start_time == 0.0:
                     self._mic_start_time = arrival
                 audio_replay.append((pcm.tobytes(), sr, ch, t_start))
-                level = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2)))
+                try:
+                    if self.is_continuous_recording:
+                        self._sess_spill_audio(
+                            "mic", pcm.tobytes(), sr, ch, t_start)
+                except Exception:
+                    pass
+                # Peak level for the UI bars (see system loop).
+                try:
+                    _mx = int(pcm.max())
+                    _mn = int(pcm.min())
+                except (ValueError, TypeError):
+                    _mx, _mn = 0, 0
+                level = float(_mx if _mx >= -_mn else -_mn)
                 self.mic_audio_buffer.append(level)
                 del pcm, data
         except Exception as exc:
@@ -1980,12 +4234,24 @@ class Recorder:
                     if dq is None or cur is None:
                         break
                     dq.append((pcm.tobytes(), sr, 2, t_start))
+                    try:
+                        if self.is_continuous_recording:
+                            self._sess_spill_audio(
+                                "app_" + str(exe), pcm.tobytes(),
+                                sr, 2, t_start)
+                    except Exception:
+                        pass
                     with self.lock:
                         if exe in self._app_captures:
                             self._app_captures[exe]["landed"] = arrival
                     if gain > 0.0:
-                        level = float(np.sqrt(np.mean(
-                            pcm.astype(np.float64) ** 2)))
+                        # Peak level for the UI bars (see system loop).
+                        try:
+                            _mx = int(pcm.max())
+                            _mn = int(pcm.min())
+                        except (ValueError, TypeError):
+                            _mx, _mn = 0, 0
+                        level = float(_mx if _mx >= -_mn else -_mn)
                         self.system_audio_buffer.append(level)
                     del pcm
                     assembled = True
@@ -2039,6 +4305,11 @@ class Recorder:
     # --------------------------------------------------------
     # AUDIO MIXING (rendered onto the video wall clock)
     # --------------------------------------------------------
+    # Backlog factor: get_read_available() overstates true sample age
+    # on this loopback path (full correction lands audibly early,
+    # none lands late). 0.5 bisects; user-judged early 2026-10-02 ->
+    # 0.25. Adjust by ear only if needed.
+    _BACKLOG_FACTOR = 0.25
 
     @staticmethod
     def _resample_cubic(arr, new_len):

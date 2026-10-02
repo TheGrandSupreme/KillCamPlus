@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 1, 0, 0),
-    prodvers=(2, 1, 0, 0),
+    filevers=(3, 1, 0, 0),
+    prodvers=(3, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,11 +18,11 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'Totti Software'),
             StringStruct('FileDescription', 'KillCam+ Replay Buffer Recorder'),
-            StringStruct('FileVersion', '2.1.0'),
+            StringStruct('FileVersion', '3.1.0'),
             StringStruct('InternalName', 'KillCamPlus'),
             StringStruct('OriginalFilename', 'KillCamPlus.exe'),
             StringStruct('ProductName', 'KillCam+'),
-            StringStruct('ProductVersion', '2.1.0'),
+            StringStruct('ProductVersion', '3.1.0'),
             StringStruct('LegalCopyright', '© 2026 Totti'),
           ]
         )

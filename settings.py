@@ -63,12 +63,18 @@ DEFAULT_SETTINGS = {
     "record_system_audio": True,
     "audio_mode": "mixed",
     "compression": "Medium",
+    "use_gpu": True,
+    "transport_mode": "raw",
+    "use_native_core": False,
     "save_folder": os.path.join(os.path.expanduser("~"), "Videos", "Captures"),
-    "hotkeys": {"save_clip": "f9", "toggle_mic": "shift+alt+m", "toggle_system_audio": "shift+alt+s"},
+    "hotkeys": {"save_clip": "f9", "toggle_mic": "shift+alt+m", "toggle_system_audio": "shift+alt+s",
+                "toggle_recording": "ctrl+shift+r"},
     "start_with_windows": False,
     "mic_volume": 100,
     "system_volume": 100,
     "monitor_index": 0,
+    "capture_source": "monitor",
+    "capture_window": "",
     "app_volumes": {},
     "last_mic_volume": 100,
     "last_system_volume": 100,
@@ -100,10 +106,22 @@ def _normalize(settings):
     settings["record_microphone"] = _as_bool(settings.get("record_microphone", True))
     settings["record_system_audio"] = _as_bool(settings.get("record_system_audio", True))
     settings["start_with_windows"] = _as_bool(settings.get("start_with_windows", False))
+    settings["use_gpu"] = _as_bool(settings.get("use_gpu", True))
+    settings["use_native_core"] = _as_bool(settings.get("use_native_core", False))
+    tmode = str(settings.get("transport_mode", "raw")).strip().lower()
+    settings["transport_mode"] = tmode if tmode in {"raw", "compressed"} else "raw"
     try:
         settings["monitor_index"] = max(0, int(settings.get("monitor_index", 0)))
     except (ValueError, TypeError):
         settings["monitor_index"] = 0
+    src = str(settings.get("capture_source", "monitor")).strip().lower()
+    if src in ("window", "active", "follow"):
+        src = "active"
+    elif src in ("pinned", "pin", "specific"):
+        src = "pinned"
+    else:
+        src = "monitor"
+    settings["capture_source"] = src
     app_vols = settings.get("app_volumes")
     clean_vols = {}
     if isinstance(app_vols, dict):

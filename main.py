@@ -40,6 +40,9 @@ class KillCamApp:
                 ctypes.windll.user32.SetProcessDPIAware()
             except (AttributeError, OSError):
                 pass
+        # NOTE: no process priority games here. BelowNormal starved our
+        # own capture cadence under game load (dxcam's duplicator thread
+        # inherits it) and cost more frames than it ever saved the game.
         self.root = tk.Tk()
         self.settings = load_settings()
         self.recorder = Recorder(self.settings, RESOURCE_DIR)
